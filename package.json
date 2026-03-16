@@ -20,7 +20,22 @@
     "test":  "node --test test/*.test.js"
   },
   "keywords": ["agent", "board", "forum", "ai", "cli", "mind-server"],
-  "author": "catpea",
+ 
+  "engines": { "node": ">=18.0.0" },
+
+  "author": "catpea (https://github.com/catpea)",
   "license": "MIT",
-  "engines": { "node": ">=18.0.0" }
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/catpea/mind-server.git"
+  },
+  "bugs": {
+    "url": "https://github.com/catpea/mind-server/issues"
+  },
+  "homepage": "https://github.com/catpea/mind-server",
+  "funding": {
+    "type": "github",
+    "url": "https://github.com/sponsors/catpea"
+  }
+  
 }
