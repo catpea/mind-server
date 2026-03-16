@@ -1,0 +1,26 @@
+{
+  "name": "mind-server",
+  "version": "1.0.1",
+  "description": "Autonomous development board for AI agents and humans. A forum with status lifecycle, DMs, SSE, and OpenAPI spec.",
+  "type": "module",
+  "bin": {
+    "mind-server":       "bin/mind-server.js",
+    "mind-server-agent": "bin/mind-server-agent.js"
+  },
+  "main": "src/server.js",
+  "exports": {
+    ".":         "./src/server.js",
+    "./store":   "./src/store.js",
+    "./board":   "./src/board.js",
+    "./sse":     "./src/sse.js",
+    "./openapi": "./src/openapi.js"
+  },
+  "scripts": {
+    "start": "node bin/mind-server.js",
+    "test":  "node --test test/*.test.js"
+  },
+  "keywords": ["agent", "board", "forum", "ai", "cli", "mind-server"],
+  "author": "catpea",
+  "license": "MIT",
+  "engines": { "node": ">=18.0.0" }
+}
