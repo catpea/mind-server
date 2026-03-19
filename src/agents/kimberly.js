@@ -16,14 +16,21 @@
  */
 
 import { BaseAgent } from './base.js';
+import { PERSONAS }  from './personas.js';
+import { SUBS, STATUS, META } from '../board-schema.js';
+import { homedir }   from 'node:os';
+import { Knowledge } from '../knowledge.js';
 
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 
 export class Kimberly extends BaseAgent {
+  static priority = 15;
   name        = 'kimberly';
   description = 'Engineering Manager. Removes blockers, tracks delivery, posts daily standups.';
   avatar      = '👔';
   role        = 'engineering-manager';
+
+  #kb = new Knowledge(homedir());
 
   async think(ctx) {
     const { board } = ctx;
@@ -32,15 +39,15 @@ export class Kimberly extends BaseAgent {
     const now      = Date.now();
 
     const stalled = allPosts.filter(p => {
-      if (!['open', 'planned', 'in-progress'].includes(p.status)) return false;
+      if (![STATUS.OPEN, STATUS.PLANNED, STATUS.IN_PROGRESS].includes(p.status)) return false;
       const age = now - new Date(p.updatedAt ?? p.createdAt).getTime();
       return age > ONE_DAY_MS;
     });
 
     const summary = await board.summary();
 
-    const securityOpen = (await board.getPosts('security', { status: 'open' }).catch(() => []))
-      .filter(p => p.meta?.severity === 'error' || p.meta?.threatLevel === 'critical');
+    const securityOpen = (await board.getPosts(SUBS.SECURITY, { status: STATUS.OPEN }).catch(() => []))
+      .filter(p => p.meta?.[META.SEVERITY] === 'error' || p.meta?.[META.THREAT_LEVEL] === 'critical');
 
     return { stalled, summary, securityOpen };
   }
@@ -58,7 +65,7 @@ export class Kimberly extends BaseAgent {
 
     if (hoursSince > 20) {
       const standup = await this.#buildStandup(summary, stalled, securityOpen, ctx);
-      await board.createPost('general', {
+      await board.createPost(SUBS.GENERAL, {
         title:  `📋 Daily Standup — ${new Date().toLocaleDateString()}`,
         body:   standup,
         author: this.name,
@@ -81,6 +88,20 @@ export class Kimberly extends BaseAgent {
         body:   `👔 Kimberly: This item has been in **${post.status}** for ${ageH}h without activity. Is there a blocker? If so, post it in r/general and I'll help remove it.`,
       });
       actions.push({ type: 'blocker-flagged', postId: post.id });
+    }
+
+    // ── Health warning: flag systemic issues ────────────────────────────────
+    if (stalled.length > 5 || securityOpen.length > 3) {
+      const { isDuplicate } = await this.postSafe(board, 'ops', {
+        title:  `⚠ Health warning — ${new Date().toLocaleDateString()}`,
+        body:   [
+          stalled.length > 5     ? `- **${stalled.length} stalled items** detected — team may be blocked` : null,
+          securityOpen.length > 3 ? `- **${securityOpen.length} open security findings** — prioritise remediation` : null,
+        ].filter(Boolean).join('\n'),
+        author: this.name,
+        type:   'announcement',
+      }).catch(() => ({ isDuplicate: true }));
+      if (!isDuplicate) actions.push({ type: 'health-warning-posted' });
     }
 
     // ── Escalate unaddressed critical security ───────────────────────────────
@@ -115,6 +136,16 @@ export class Kimberly extends BaseAgent {
       `**Open security findings:** ${securityOpen.length}`,
     ].join('\n');
 
+    // Cross-project knowledge section
+    let crossProjectSection = '';
+    try {
+      const recent = await this.#kb.recent(5);
+      if (recent.length) {
+        const lines = recent.map(r => `- **[${r.type}]** ${r.title} _(${r.agentName}, ${r.projectDir.split('/').at(-1)})_`).join('\n');
+        crossProjectSection = `\n\n## Cross-Project Patterns (recent)\n${lines}`;
+      }
+    } catch { /* advisory only */ }
+
     if (ctx.ai.isAvailable() && stalled.length > 0) {
       const insight = await ctx.ai.ask(
         `You are Kimberly, an engineering manager. Write a one-paragraph standup summary.
@@ -122,11 +153,11 @@ Board: ${JSON.stringify(byStatus)}
 Stalled items: ${stalled.map(p => p.title).slice(0, 5).join(', ')}
 Security open: ${securityOpen.length}
 Be brief, actionable, and encouraging.`,
-        { system: 'You are a supportive engineering manager. One paragraph, plain text, no markdown headers.' }
+        { system: PERSONAS.kimberly }
       );
-      return base + '\n\n' + (insight ?? '');
+      return base + crossProjectSection + '\n\n' + (insight ?? '');
     }
 
-    return base;
+    return base + crossProjectSection;
   }
 }

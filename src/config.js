@@ -2,15 +2,13 @@
  * config.js — Persistent configuration for mind-server.
  *
  * Non-secret settings are stored in <targetDir>/.mind-server/config.json.
- * Secrets (API keys) always come from environment variables — never stored.
  *
  * Config shape:
  * {
  *   "port":      3002,
  *   "ai": {
- *     "provider": "anthropic" | "openai" | "local",
- *     "model":    "claude-sonnet-4-6",
- *     "baseUrl":  null | "http://localhost:11434/v1"
+ *     "model":    "llama3",
+ *     "baseUrl":  "http://localhost:11434/v1"
  *   }
  * }
  *
@@ -26,9 +24,8 @@ import { join }                from 'node:path';
 const DEFAULTS = {
   port: 3002,
   ai: {
-    provider: 'anthropic',
-    model:    'claude-sonnet-4-6',
-    baseUrl:  null,
+    model:   'llama3',
+    baseUrl: 'http://localhost:11434/v1',
   },
 };
 
@@ -70,5 +67,29 @@ export class Config {
 
   async #save() {
     await writeFile(this.#path, JSON.stringify(this.#data, null, 2));
+  }
+
+  /**
+   * Watch config.json for changes and call callback(newConfig) when it changes.
+   * Returns an unwatch function.
+   * Debounced 200ms to avoid double-fires on save.
+   */
+  watch(callback) {
+    import('node:fs').then(({ watch }) => {
+      let debounce = null;
+      const watcher = watch(this.#path, () => {
+        clearTimeout(debounce);
+        debounce = setTimeout(async () => {
+          try {
+            const text = await readFile(this.#path, 'utf8');
+            const data = JSON.parse(text);
+            this.#data = { ...DEFAULTS, ...data, ai: { ...DEFAULTS.ai, ...(data.ai ?? {}) } };
+            callback(this.#data);
+          } catch { /* ignore malformed config during save */ }
+        }, 200);
+      });
+      this._watcher = watcher; // store for unwatch
+    }).catch(() => {}); // fs.watch might not be available
+    return () => this._watcher?.close();
   }
 }

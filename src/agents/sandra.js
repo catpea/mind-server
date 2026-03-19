@@ -16,32 +16,37 @@
  */
 
 import { BaseAgent }                    from './base.js';
-import { readFile, readdir, stat }      from 'node:fs/promises';
+import { readFile }                     from 'node:fs/promises';
 import { existsSync }                   from 'node:fs';
-import { join, extname, relative }      from 'node:path';
+import { join }                         from 'node:path';
+import { SUBS, META, SEVERITY }         from '../board-schema.js';
+import { PERSONAS }                     from './personas.js';
 
 export class Sandra extends BaseAgent {
+  static priority = 7;
   name        = 'sandra';
   description = 'QA scanner. Finds quality issues in the project and posts findings.';
   avatar      = '🔬';
   role        = 'qa';
 
   async think(ctx) {
-    const { targetDir, board } = ctx;
+    const { targetDir } = ctx;
 
-    // Gather project structure
-    const structure = await this.#scanStructure(targetDir);
+    // Gather project structure (uses search tool for intelligent file sampling)
+    const structure = await this.#scanStructure(ctx);
 
-    // Existing quality posts (to avoid duplicates)
-    const existing = await board.getAllPosts({ type: 'quality' }).catch(() => []);
-    const openTitles = new Set(existing.filter(p => p.status !== 'done').map(p => p.title));
+    // Test coverage map
+    const coverage = await ctx.tools.buildCoverageMap().catch(() => null);
 
-    return { structure, openTitles };
+    // Read linter report from bin/linter.js if present (application-magic specific rules)
+    const linterFindings = await this.#readLinterReport(targetDir);
+
+    return { structure, coverage, linterFindings };
   }
 
   async act(plan, ctx) {
     const { board, targetDir } = ctx;
-    const { structure, openTitles } = plan;
+    const { structure, coverage, linterFindings } = plan;
     const actions = [];
 
     this.log(`scanning ${targetDir}`, ctx);
@@ -67,6 +72,42 @@ export class Sandra extends BaseAgent {
       findings.push({ title: 'No test files found', body: 'No test files detected (looked for test/, tests/, *.test.js). Add tests to verify correctness.', severity: 'warning' });
     }
 
+    // ── npm audit — security vulnerabilities in dependencies ───────────────
+    const pkgPath = join(targetDir, 'package.json');
+    if (existsSync(pkgPath)) {
+      const auditResult = await ctx.tools.shell('npm audit --json', { timeout: 30_000 });
+      if (auditResult.stdout) {
+        try {
+          const audit = JSON.parse(auditResult.stdout);
+          const vulnCount = audit.metadata?.vulnerabilities;
+          if (vulnCount) {
+            const high   = (vulnCount.high ?? 0) + (vulnCount.critical ?? 0);
+            const total  = Object.values(vulnCount).reduce((s, n) => s + (n ?? 0), 0);
+            if (total > 0) {
+              findings.push({
+                title:    `npm audit: ${total} vulnerabilit${total === 1 ? 'y' : 'ies'} (${high} high/critical)`,
+                body:     `\`npm audit\` found ${total} vulnerabilities:\n\`\`\`\n${JSON.stringify(vulnCount, null, 2)}\n\`\`\`\n\n**Fix:** Run \`npm audit fix\` for automatic fixes, or \`npm audit fix --force\` for breaking changes.`,
+                severity: high > 0 ? SEVERITY.ERROR : SEVERITY.WARNING,
+              });
+            }
+          }
+        } catch { /* audit JSON malformed — skip */ }
+      }
+    }
+
+    // ── Test coverage report ────────────────────────────────────────────────
+    if (coverage && coverage.total > 0) {
+      const label = `Test coverage: ${coverage.pct}% (${coverage.covered.length}/${coverage.total} files)`;
+      if (coverage.pct < 50) {
+        findings.push({
+          title:    `[QA] Low test coverage — ${coverage.pct}%`,
+          body:     `${label}\n\nUntested files (${coverage.uncovered.length} total):\n${coverage.uncovered.slice(0, 8).map(f => `- \`${f}\``).join('\n')}\n\nPrioritise testing files with complex logic or error paths.`,
+          severity: SEVERITY.WARNING,
+        });
+      }
+      this.log(label, ctx);
+    }
+
     // ── AI-powered code review (sample of source files) ────────────────────
 
     if (ctx.ai.isAvailable() && structure.sourceFiles.length > 0) {
@@ -81,19 +122,28 @@ export class Sandra extends BaseAgent {
       }
     }
 
+    // ── Findings from bin/linter.js report ─────────────────────────────────
+    // These are application-magic-specific package hygiene rules (PKG001-006, WC001-002).
+    // The report is written by: node bin/linter.js --report <targetDir>
+
+    if (linterFindings.length > 0) {
+      this.log(`merging ${linterFindings.length} findings from linter report`, ctx);
+      findings.push(...linterFindings);
+    }
+
     // ── Post new findings ───────────────────────────────────────────────────
 
-    await board.ensureSub('quality');
+    await board.ensureSub(SUBS.QUALITY);
     let posted = 0;
 
     for (const finding of findings) {
-      if (openTitles.has(finding.title)) continue; // already open
-      await board.createPost('quality', {
+      if (await this.findDuplicate(board, SUBS.QUALITY, finding.title)) continue;
+      await board.createPost(SUBS.QUALITY, {
         title:  finding.title,
         body:   finding.body,
         author: this.name,
         type:   'quality',
-        meta:   { severity: finding.severity ?? 'info' },
+        meta:   { [META.SEVERITY]: finding.severity ?? SEVERITY.INFO },
       });
       this.log(`posted: ${finding.title}`, ctx);
       actions.push({ type: 'posted-finding', title: finding.title });
@@ -105,14 +155,15 @@ export class Sandra extends BaseAgent {
     await this.remember('scan', {
       targetDir,
       files:       structure.sourceFiles.length,
+      coveragePct: coverage?.pct ?? null,
       findingsNew: posted,
     });
 
     return { outcome: posted > 0 ? 'findings-posted' : 'clean', count: posted, actions };
   }
 
-  async #scanStructure(targetDir) {
-    const ignore = new Set(['.mind-server', '.git', 'node_modules', 'dist', '.cache', 'coverage']);
+  async #scanStructure(ctx) {
+    const { targetDir, tools } = ctx;
 
     const pkgPath = join(targetDir, 'package.json');
     let packageJson = null;
@@ -120,40 +171,56 @@ export class Sandra extends BaseAgent {
       try { packageJson = JSON.parse(await readFile(pkgPath, 'utf8')); } catch { /* skip */ }
     }
 
-    // Walk top 2 levels
-    const sourceExts = new Set(['.js', '.mjs', '.ts', '.jsx', '.tsx', '.py']);
+    // Use search tool to discover files — excludes node_modules/.git automatically
+    const allFiles    = await tools.findFiles('**/*');
     const testPattern = /test|spec/i;
-    const sourceFiles = [];
-    let   hasTests    = false;
-    let   hasReadme   = false;
 
-    async function walk(dir, depth = 0) {
-      if (depth > 2) return;
-      let entries;
-      try { entries = await readdir(dir, { withFileTypes: true }); } catch { return; }
-      for (const e of entries) {
-        if (ignore.has(e.name)) continue;
-        const rel = relative(targetDir, join(dir, e.name));
-        if (e.isDirectory()) {
-          if (testPattern.test(e.name)) hasTests = true;
-          await walk(join(dir, e.name), depth + 1);
-        } else {
-          if (/readme/i.test(e.name)) hasReadme = true;
-          if (testPattern.test(e.name) && sourceExts.has(extname(e.name))) hasTests = true;
-          if (sourceExts.has(extname(e.name)) && !testPattern.test(e.name)) sourceFiles.push(rel);
-        }
-      }
-    }
+    const hasReadme   = allFiles.some(f => /readme/i.test(f));
+    const hasTests    = allFiles.some(f => testPattern.test(f) && /\.(js|mjs|ts)$/.test(f));
 
-    await walk(targetDir);
+    // Source files: non-test JS/TS files (not from test dirs)
+    const sourceFiles = allFiles
+      .filter(f => /\.(js|mjs|ts|jsx|tsx|py)$/.test(f) && !testPattern.test(f))
+      .slice(0, 20);
 
     return {
       hasPackageJson: !!packageJson,
       packageJson,
       hasReadme,
       hasTests,
-      sourceFiles: sourceFiles.slice(0, 20), // cap for performance
+      sourceFiles,
     };
+  }
+
+  async #readLinterReport(targetDir) {
+    const reportPath = join(targetDir, '.mind-server', 'linter-report.json');
+    if (!existsSync(reportPath)) return [];
+    try {
+      const raw    = await readFile(reportPath, 'utf8');
+      const report = JSON.parse(raw);
+      if (!Array.isArray(report.issues)) return [];
+
+      // Convert linter issue shape → Sandra finding shape
+      // Group by pkg so we don't flood r/quality with one post per micro-issue;
+      // instead emit one post per (pkg, id) pair — same granularity as the browser linter.
+      return report.issues.map(issue => ({
+        title:    `${issue.pkg}@${issue.version} — ${issue.id}`,
+        body:     [
+          `**Package:** \`${issue.pkg}\` (v${issue.version})`,
+          `**Rule:** ${issue.id}`,
+          `**Severity:** ${issue.severity}`,
+          ``,
+          issue.message,
+          issue.blocked ? `\n> ⚠️ Blocked by: **${issue.blocked}**` : '',
+          issue.fixable ? `\n> 🔧 Auto-fixable` : '',
+          ``,
+          `*Reported by \`bin/linter.js\` — ${report.generated}*`,
+        ].filter(l => l !== '').join('\n'),
+        severity: issue.severity,
+      }));
+    } catch {
+      return [];
+    }
   }
 
   async #reviewFile(filepath, content, ctx) {
@@ -174,9 +241,7 @@ Respond with JSON array (may be empty):
   ...
 ]`;
 
-    const issues = await ctx.ai.askJSON(prompt, {
-      system: 'You are a senior code reviewer. Only report real bugs and problems, not style issues. Reply with JSON only.',
-    });
+    const issues = await ctx.ai.askJSON(prompt, { system: PERSONAS.sandra });
     return Array.isArray(issues) ? issues.slice(0, 3) : []; // cap to 3 per file
   }
 }

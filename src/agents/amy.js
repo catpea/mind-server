@@ -17,8 +17,11 @@
  */
 
 import { BaseAgent } from './base.js';
+import { SUBS, STATUS, META, AMY_STATUS } from '../board-schema.js';
+import { PERSONAS } from './personas.js';
 
 export class Amy extends BaseAgent {
+  static priority = 1;
   name        = 'amy';
   description = 'Product Manager. Validates requests, clarifies requirements, prioritises the backlog.';
   avatar      = '🗺';
@@ -27,8 +30,8 @@ export class Amy extends BaseAgent {
   async think(ctx) {
     const { board } = ctx;
 
-    const requests    = await board.getPosts('requests', { status: 'open' }).catch(() => []);
-    const needsReview = requests.filter(p => !p.meta?.amyReviewed);
+    const requests    = await board.getPosts(SUBS.REQUESTS, { status: STATUS.OPEN }).catch(() => []);
+    const needsReview = requests.filter(p => !p.meta?.[META.AMY_REVIEWED]);
     const todos       = await board.getAllPosts({ type: 'todo' }).catch(() => []);
 
     return { needsReview, todos };
@@ -53,7 +56,7 @@ export class Amy extends BaseAgent {
           body:   `🗺 Amy needs more information before this can be planned:\n\n${assessment.questions.map(q => `- ${q}`).join('\n')}`,
         });
         await board.updatePost(req.id, {
-          meta: { ...req.meta, amyReviewed: true, amyStatus: 'needs-clarification' },
+          meta: { ...req.meta, [META.AMY_REVIEWED]: true, [META.AMY_STATUS]: AMY_STATUS.NEEDS_CLARIFICATION },
         });
         actions.push({ type: 'clarification-requested', postId: req.id });
         this.log(`requested clarification on "${req.title}"`, ctx);
@@ -67,9 +70,9 @@ export class Amy extends BaseAgent {
         await board.updatePost(req.id, {
           meta: {
             ...req.meta,
-            amyReviewed: true,
-            amyStatus:   'approved',
-            priority:    assessment.priority,
+            [META.AMY_REVIEWED]: true,
+            [META.AMY_STATUS]:   AMY_STATUS.APPROVED,
+            priority:            assessment.priority,
           },
         });
         actions.push({ type: 'approved', postId: req.id, priority: assessment.priority });
@@ -83,10 +86,8 @@ export class Amy extends BaseAgent {
 
   async #assessWithAI(req, todos, ctx) {
     const todoTitles = todos.map(t => t.title).join(', ');
-    const result     = await ctx.ai.askJSON(
-      `You are Amy, a Product Manager reviewing a feature request.
-
-Request title: ${req.title}
+    const result     = await ctx.ai.fast.askJSON(
+      `Request title: ${req.title}
 Request body: ${req.body || '(none)'}
 Existing work: ${todoTitles.slice(0, 400) || '(none)'}
 
@@ -102,7 +103,7 @@ Respond with JSON:
   "priority": "high|medium|low",
   "rationale": "One sentence explanation"
 }`,
-      { system: 'You are a product manager. Be concise and decisive. Reply with JSON only.' }
+      { system: PERSONAS.amy }
     );
     return result ?? this.#assessWithoutAI(req);
   }
@@ -115,5 +116,34 @@ Respond with JSON:
       priority:           'medium',
       rationale:          'Auto-assessed (AI unavailable).',
     };
+  }
+
+  /**
+   * Amy answers Monica's clarification requests from a PM perspective.
+   * She enriches vague requests with goals, acceptance criteria, and context.
+   */
+  async answerQuestion(dm, ctx) {
+    if (!ctx.ai?.isAvailable()) {
+      return `AI not available — proceed with what information you have. Flag any missing requirements as questions in the todo plan.`;
+    }
+    const contextNote = ctx.projectContext
+      ? `\n\n## Project Context\n${ctx.projectContext}`
+      : '';
+    const prompt = `You are Amy, the product manager.
+Monica (the planner) needs clarification before she can write a proper implementation plan.${contextNote}
+
+## Monica's question
+${dm.body}
+
+Provide:
+1. **User goal** — What does the user actually want to achieve?
+2. **Acceptance criteria** — 2-4 specific, testable outcomes
+3. **Out of scope** — What should NOT be built as part of this
+4. **Priority level** — high / medium / low and why
+
+Be concise. Monica will use this to write the implementation plan.`;
+    return ctx.ai.ask(prompt, {
+      system: 'You are a product manager providing requirements clarification. Be concise and specific.',
+    });
   }
 }

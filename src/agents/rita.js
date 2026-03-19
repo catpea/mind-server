@@ -20,14 +20,21 @@ import { BaseAgent }               from './base.js';
 import { readFile }                from 'node:fs/promises';
 import { existsSync }              from 'node:fs';
 import { join, extname }           from 'node:path';
+import { homedir }                 from 'node:os';
+import { SUBS, STATUS, META }      from '../board-schema.js';
+import { PERSONAS }                from './personas.js';
+import { Knowledge }               from '../knowledge.js';
 
 const READABLE_EXTS = new Set(['.js', '.mjs', '.ts', '.jsx', '.tsx', '.json', '.md', '.css', '.py']);
 
 export class Rita extends BaseAgent {
+  static priority = 5;
   name        = 'rita';
   description = 'Reviewer. Assesses implementations and approves or requests changes.';
   avatar      = '🔍';
   role        = 'reviewer';
+
+  #kb = new Knowledge(homedir());
 
   async think(ctx) {
     const { board } = ctx;
@@ -35,7 +42,7 @@ export class Rita extends BaseAgent {
     const dms = await board.getDMs({ to: this.name, unreadOnly: true });
     for (const dm of dms) await board.markDMRead(dm.id);
 
-    const inReview = await board.getPosts('todo', { status: 'review' }).catch(() => []);
+    const inReview = await board.getPosts(SUBS.TODO, { status: STATUS.REVIEW }).catch(() => []);
     return { inReview, dms };
   }
 
@@ -60,7 +67,7 @@ export class Rita extends BaseAgent {
       .at(-1);
 
     // Read the files that were changed
-    const filesWritten = implComment?.meta?.filesWritten ?? [];
+    const filesWritten = implComment?.meta?.[META.FILES_WRITTEN] ?? [];
     const fileContents = {};
     for (const filepath of filesWritten) {
       const abs = join(targetDir, filepath);
@@ -87,19 +94,19 @@ export class Rita extends BaseAgent {
         author: this.name,
         body:   `✅ Approved\n\n${reviewComment}`,
       });
-      await board.advanceStatus(post.id, 'done', {
+      await board.advanceStatus(post.id, STATUS.DONE, {
         author:  this.name,
         comment: 'Implementation approved.',
       });
 
       // DM the original requester
-      if (post.meta?.requestAuthor) {
+      if (post.meta?.[META.REQUEST_AUTHOR]) {
         await board.sendDM({
           from:    this.name,
-          to:      post.meta.requestAuthor,
+          to:      post.meta[META.REQUEST_AUTHOR],
           subject: `Done: ${post.title}`,
           body:    `Your request "${post.title}" has been implemented and approved.`,
-          meta:    { todoId: post.id },
+          meta:    { [META.TODO_ID]: post.id },
         });
       }
 
@@ -107,11 +114,21 @@ export class Rita extends BaseAgent {
       this.log(`approved "${post.title}"`, ctx);
 
     } else {
+      // Write anti-pattern to knowledge base
+      await this.#kb.write({
+        projectDir: ctx.targetDir,
+        agentName:  this.name,
+        type:       'anti-pattern',
+        title:      `Review: ${post.title}`,
+        body:       reviewComment.slice(0, 500),
+        tags:       ['review', 'anti-pattern'],
+      }).catch(() => {});
+
       await board.addComment(post.id, {
         author: this.name,
         body:   `🔄 Changes requested\n\n${reviewComment}`,
       });
-      await board.advanceStatus(post.id, 'in-progress', {
+      await board.advanceStatus(post.id, STATUS.IN_PROGRESS, {
         author:  this.name,
         comment: 'Sent back for revisions.',
       });
@@ -121,7 +138,7 @@ export class Rita extends BaseAgent {
         to:      'erica',
         subject: `Revision needed: ${post.title}`,
         body:    `Please revise ${post.id}:\n\n${reviewComment}`,
-        meta:    { todoId: post.id },
+        meta:    { [META.TODO_ID]: post.id },
       });
 
       actions.push({ type: 'requested-changes', todoId: post.id });
@@ -131,14 +148,37 @@ export class Rita extends BaseAgent {
     return { outcome: approved ? 'approved' : 'changes-requested', actions };
   }
 
+  /**
+   * Rita gives Erica pre-implementation feedback when asked.
+   * She reads the todo plan and flags concerns before code is written.
+   */
+  async answerQuestion(dm, ctx) {
+    if (!ctx.ai?.isAvailable()) {
+      return `I'd like to review your plan but AI isn't available right now. Go ahead with your best judgment — I'll review the code once it's written.`;
+    }
+    const contextNote = ctx.projectContext
+      ? `\n\n## Project Context\n${ctx.projectContext}`
+      : '';
+    const prompt = `Erica is about to implement a task and wants your feedback before writing code.${contextNote}
+
+## Erica's question
+${dm.body}
+
+Give concise, actionable pre-implementation feedback:
+- Flag any architectural concerns or missing edge cases
+- Point out files she should look at that she may have missed
+- Suggest a simpler approach if one exists
+- Distinguish blocking issues from non-blocking suggestions
+- If the plan looks good, say so clearly`;
+    return ctx.ai.full.ask(prompt, { system: PERSONAS.rita });
+  }
+
   async #reviewWithAI(post, implSummary, fileContents, ctx) {
     const fileContext = Object.entries(fileContents)
       .map(([path, content]) => `### ${path}\n\`\`\`\n${content.slice(0, 2000)}\n\`\`\``)
       .join('\n\n');
 
-    const prompt = `You are Rita, a software engineering reviewer.
-
-## Task that was implemented
+    const prompt = `## Task
 ${post.title}
 
 ## Plan
@@ -147,17 +187,16 @@ ${post.body ?? '(no plan)'}
 ## Implementation summary (from Erica)
 ${implSummary || '(no summary)'}
 
-## Actual file contents after implementation
+## Actual file contents
 ${fileContext || '(no files readable)'}
 
-Review this implementation. Respond with JSON:
+Review this implementation. Correctness first, performance second, style last.
+Respond with JSON:
 {
   "approved": true or false,
-  "comment": "Your review comment — specific, actionable. If approved, say what was good. If not, say exactly what needs to change."
+  "comment": "Specific, line-level feedback. Label each issue [blocking] or [non-blocking]. If approved, note what was done well."
 }`;
 
-    return ctx.ai.askJSON(prompt, {
-      system: 'You are a senior software engineer doing a code review. Be specific and fair. Reply with JSON only.',
-    });
+    return ctx.ai.full.askJSON(prompt, { system: PERSONAS.rita });
   }
 }

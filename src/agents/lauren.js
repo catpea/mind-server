@@ -21,6 +21,7 @@
 import { BaseAgent }               from './base.js';
 import { readFile, readdir }       from 'node:fs/promises';
 import { join, extname, relative } from 'node:path';
+import { SUBS, META, SEVERITY }   from '../board-schema.js';
 
 // Accessibility patterns to check
 const A11Y_PATTERNS = [
@@ -61,28 +62,25 @@ const UX_PATTERNS = [
 ];
 
 export class Lauren extends BaseAgent {
+  static priority = 13;
   name        = 'lauren';
   description = 'UX Designer. Accessibility review, usability patterns, human-friendly error messages, i18n readiness.';
   avatar      = '🎨';
   role        = 'ux-designer';
 
   async think(ctx) {
-    const { targetDir, board } = ctx;
+    const { targetDir } = ctx;
 
-    const files    = await this.#collectFiles(targetDir);
-    const existing = (await board.getPosts('ux').catch(() => []))
-      .filter(p => p.status !== 'done' && p.author === this.name)
-      .map(p => p.title);
-
-    return { files, existing, targetDir };
+    const files = await this.#collectFiles(targetDir);
+    return { files, targetDir };
   }
 
   async act(plan, ctx) {
     const { board }                = ctx;
-    const { files, existing, targetDir } = plan;
+    const { files, targetDir } = plan;
     const actions                  = [];
 
-    await board.ensureSub('ux');
+    await board.ensureSub(SUBS.UX);
     this.log(`reviewing ${files.length} UI files for accessibility and usability`, ctx);
 
     const findings = [];
@@ -106,16 +104,14 @@ export class Lauren extends BaseAgent {
     }
 
     // ── Post new findings ─────────────────────────────────────────────────────
-    const seen = new Set(existing);
     for (const finding of findings) {
-      if (seen.has(finding.title)) continue;
-      seen.add(finding.title);
-      await board.createPost('ux', {
+      if (await this.findDuplicate(board, SUBS.UX, finding.title)) continue;
+      await board.createPost(SUBS.UX, {
         title:  finding.title,
         body:   finding.body,
         author: this.name,
         type:   'quality',
-        meta:   { severity: finding.severity },
+        meta:   { [META.SEVERITY]: finding.severity },
       });
       this.log(finding.title, ctx);
       actions.push({ type: 'finding', title: finding.title });

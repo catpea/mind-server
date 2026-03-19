@@ -24,6 +24,24 @@ import { readdir, readFile, writeFile, mkdir, access } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
+/**
+ * Thrown by store.put() when a caller supplies data._rev that doesn't match the
+ * current on-disk revision — indicating a concurrent write conflict.
+ *
+ * Callers can catch this specifically to retry with a fresh read:
+ *   try { await store.put(...) } catch (err) { if (err instanceof ConflictError) ... }
+ */
+export class ConflictError extends Error {
+  constructor(collection, id, currentRev, expectedRev) {
+    super(`Conflict: ${collection}/${id} is at rev ${currentRev}, expected ${expectedRev}`);
+    this.name        = 'ConflictError';
+    this.collection  = collection;
+    this.id          = id;
+    this.currentRev  = currentRev;
+    this.expectedRev = expectedRev;
+  }
+}
+
 export class Store {
   #dataDir;
 
@@ -105,6 +123,12 @@ export class Store {
     if (latest) {
       rev = parseInt(latest.split('-')[0], 10);
     }
+
+    // Optimistic concurrency: if caller supplied _rev, it must match current
+    if (data._rev !== undefined && data._rev !== rev) {
+      throw new ConflictError(collection, data.id, rev, data._rev);
+    }
+
     rev += 1;
 
     const uid = randomUUID();

@@ -23,12 +23,13 @@ export class SseHub {
    * Sets the correct headers and keeps the connection alive.
    * Removes the client when it disconnects.
    */
-  connect(req, res) {
+  connect(req, res, extraHeaders = {}) {
     res.writeHead(200, {
       'Content-Type':  'text/event-stream',
       'Cache-Control': 'no-cache',
       'Connection':    'keep-alive',
       'X-Accel-Buffering': 'no', // disable nginx buffering
+      ...extraHeaders,
     });
     res.write(':ok\n\n'); // initial ping so client knows it's live
 

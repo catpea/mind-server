@@ -18,10 +18,13 @@
  */
 
 import { BaseAgent } from './base.js';
+import { PERSONAS } from './personas.js';
+import { SUBS, STATUS, META, AMY_STATUS } from '../board-schema.js';
 
 const ONE_WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 
 export class Jessica extends BaseAgent {
+  static priority = 14;
   name        = 'jessica';
   description = 'Business Analyst. Validates that completed work solves the original problem. Outcome alignment, scope, and traceability.';
   avatar      = '📊';
@@ -31,7 +34,7 @@ export class Jessica extends BaseAgent {
     const { board } = ctx;
 
     // Recently completed work
-    const doneTodos = (await board.getPosts('todo', { status: 'done' }).catch(() => []))
+    const doneTodos = (await board.getPosts(SUBS.TODO, { status: STATUS.DONE }).catch(() => []))
       .filter(p => !p.meta?.jessicaReviewed);
 
     // All requests for cross-reference
@@ -40,16 +43,16 @@ export class Jessica extends BaseAgent {
     // Orphaned todos — implemented without a corresponding request
     const requestTitles = new Set(requests.map(r => r.title.toLowerCase()));
     const orphaned = doneTodos.filter(t => {
-      const linked = t.meta?.requestId || t.meta?.linkedRequest;
+      const linked = t.meta?.[META.REQUEST_ID] || t.meta?.linkedRequest;
       return !linked && !requestTitles.has(t.title.toLowerCase());
     });
 
     // Open requests that have been open > 2 weeks with no todo
     const now         = Date.now();
     const stalledReqs = requests
-      .filter(r => r.status === 'open')
+      .filter(r => r.status === STATUS.OPEN)
       .filter(r => (now - new Date(r.createdAt).getTime()) > 2 * ONE_WEEK_MS)
-      .filter(r => !r.meta?.amyStatus || r.meta.amyStatus !== 'needs-clarification');
+      .filter(r => !r.meta?.[META.AMY_STATUS] || r.meta[META.AMY_STATUS] !== AMY_STATUS.NEEDS_CLARIFICATION);
 
     return { doneTodos, orphaned, stalledReqs, requests };
   }
@@ -123,7 +126,7 @@ export class Jessica extends BaseAgent {
 
   async #reviewWithAI(todo, requests, ctx) {
     const relatedRequest = requests.find(r =>
-      r.id === todo.meta?.requestId ||
+      r.id === todo.meta?.[META.REQUEST_ID] ||
       todo.title.toLowerCase().includes(r.title.toLowerCase().slice(0, 20))
     );
 
@@ -144,13 +147,13 @@ Score 1-5: 5 = excellent outcome alignment, 1 = unclear or misaligned.
 
 Respond with JSON:
 { "score": 1-5, "comment": "📊 Jessica: [your outcome review comment — be constructive, max 3 sentences]" }`,
-      { system: 'You are a business analyst. Focus on user outcomes, not code quality. Reply with JSON only.' }
+      { system: PERSONAS.jessica }
     );
     return result ?? this.#reviewWithoutAI(todo, requests);
   }
 
   #reviewWithoutAI(todo, requests) {
-    const linked = requests.find(r => r.id === todo.meta?.requestId);
+    const linked = requests.find(r => r.id === todo.meta?.[META.REQUEST_ID]);
     const score  = linked ? 3 : 2;
     const comment = linked
       ? `📊 Jessica: This is linked to request "${linked.title}". Marking as reviewed. *(AI unavailable for outcome analysis.)*`
@@ -167,11 +170,11 @@ Recently completed: ${doneTodos.map(t => t.title).slice(0, 5).join(', ') || 'non
 Stalled requests (>2 weeks open): ${stalledReqs.map(r => r.title).slice(0, 3).join(', ') || 'none'}
 
 Write a 2-paragraph product health update: what got done, and what concerns you have about backlog health. Be honest but constructive.`,
-          { system: 'You are a product-focused business analyst. Write for a human team audience.' }
+          { system: PERSONAS.jessica }
         )
       : `**Completed this week:** ${doneTodos.length} items\n**Stalled requests:** ${stalledReqs.length} open requests over 2 weeks old`;
 
-    await board.createPost('general', {
+    await board.createPost(SUBS.GENERAL, {
       title:  `📊 Weekly Product Health — ${new Date().toLocaleDateString()}`,
       body:   reportBody ?? '',
       author: this.name,

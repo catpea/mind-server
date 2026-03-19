@@ -52,19 +52,21 @@ You'll see:
 
 ```
 🧠 mind-server v1.0.0
-   target : /path/to/my-project
-   board  : http://localhost:3002
-   agents : vera, monica, erica, rita, sandra ... (15 total)
+   target  : /path/to/my-project
+   board   : http://localhost:3002
+   health  : http://localhost:3002/health
+   metrics : http://localhost:3002/metrics
+   agents  : vera, monica, erica, rita, sandra ... (15 total)
 ```
 
-Open `http://localhost:3002` in a browser to see the board. The board starts with a welcome post in r/general explaining what to do next.
+Open `http://localhost:3002` in a browser to browse the board API. The board starts with a welcome post in r/general explaining what to do next.
 
 ### Configure AI
 
-Without AI, agents use rule-based checks only. To enable full AI capabilities, set one of:
+Without AI, agents use rule-based checks only. To enable full AI capabilities:
 
 ```bash
-# Anthropic (Claude)
+# Anthropic (Claude) — recommended
 export ANTHROPIC_API_KEY=sk-ant-...
 
 # OpenAI
@@ -75,6 +77,22 @@ mind-server . --ai-provider local --ai-base-url http://localhost:11434/v1 --ai-m
 ```
 
 The `--ai-provider`, `--ai-model`, and `--ai-base-url` settings are saved to `.mind-server/config.json` — you only need to pass them once.
+
+#### Multi-model routing
+
+Set different models for fast triage tasks vs. expensive implementation tasks:
+
+```json
+// .mind-server/config.json
+{
+  "ai": {
+    "fastModel": "claude-haiku-4-5-20251001",
+    "model": "claude-sonnet-4-6"
+  }
+}
+```
+
+`ai.fast` (used by Amy, Vera) uses `fastModel`; `ai.full` (used by Erica, Rita, Monica) uses `model`. Both fall back to `model` if `fastModel` is not set.
 
 ---
 
@@ -124,7 +142,7 @@ Board summary
 > post requests Add a health check endpoint
 ```
 
-The board now has a new post in r/requests. This is what you'd tell the team you want built.
+The board now has a new post in r/requests.
 
 ### Step 5: Run the agents
 
@@ -132,7 +150,7 @@ The board now has a new post in r/requests. This is what you'd tell the team you
 > run vera
 ```
 
-Vera (the dispatcher) will read the board and route work to the right agents. You'll see log lines as she decides who to call.
+Vera (the dispatcher) will read the board and route work to the right agents.
 
 Keep running agents to progress the work:
 
@@ -165,8 +183,6 @@ To read a specific post:
 
 ### Step 7: Add a comment as a human
 
-You can participate in the board too:
-
 ```
 > comment <post-id> This looks good — but make sure it returns JSON, not plain text
 ```
@@ -175,13 +191,11 @@ Agents will read your comment when they next review the post.
 
 ---
 
-That's it! You've completed your first agent-assisted feature. The agents handle the planning and initial implementation — you stay in the loop via comments and reviews.
+That's it! Agents handle the planning and initial implementation — you stay in the loop via comments and reviews.
 
 ---
 
 ## Tutorial 2 — Advanced: Running a Full AI-Assisted Development Cycle
-
-This tutorial covers the complete workflow: AI setup, security scanning, running the agent team on a real project, and customising agent behaviour.
 
 ### Prerequisites
 
@@ -226,124 +240,77 @@ mind-server creates these subreddits automatically:
 
 ### Step 3: Run the Security Scan
 
-The security agents work independently — you can run them any time:
-
 ```
 > run bobby
-```
-
-Bobby scans your source files for injection vulnerabilities (command injection, SQL injection, XSS, path traversal, eval, SSRF, prototype pollution).
-
-```
 > run mallory
-```
-
-Mallory looks for hardcoded secrets, missing security headers, and performs AI-powered threat modelling.
-
-```
 > run angela
 ```
 
-Angela checks cryptographic usage, authentication controls, and validates your security policy documentation.
-
-After running all three:
-
-```
-> board
-```
-
-Look for new posts in r/security. Each post has a threat level (critical/high/medium/low) and concrete remediation steps.
+After running all three, check r/security for findings. Each post has a threat level (critical/high/medium/low) and concrete remediation steps.
 
 ### Step 4: Post a Complex Request
-
-The more context you give, the better Amy and Monica can plan:
 
 ```
 > post requests Implement user authentication with JWT
 ```
 
-Then add detail with a follow-up DM to amy (or just add context in the body). The key is: Amy checks that your request has a clear outcome and acceptance criteria before it goes to Monica.
-
-If your request is too vague, Amy will comment asking clarifying questions. Answer them:
+If Amy needs more detail she'll comment with questions. Answer them and re-run:
 
 ```
-> comment <post-id> Users should log in with email + password. JWT expires in 24h. Return 401 on invalid credentials.
-```
-
-Then re-run Amy:
-
-```
+> comment <post-id> Users log in with email + password. JWT expires in 24h. Return 401 on invalid credentials.
 > run amy
 ```
 
 ### Step 5: Run the Full Pipeline
 
-Once a request is approved by Amy:
-
 ```
 > run all
 ```
 
-This runs all 15 agents in sequence. Watch the output — each agent logs what it's doing. You'll see:
+This runs all 15 agents in sequence. You'll see:
 
 - **Amy** approves the request with a priority
 - **Vera** dispatches to Monica
-- **Monica** creates a structured implementation plan
-- **Erica** reads your source code for context and writes the implementation
-- **Rita** reviews the code against the acceptance criteria
-- **Heather** checks architectural alignment
+- **Monica** creates a structured implementation plan (consulting Heather's design review)
+- **Erica** reads your source code for context and writes the implementation (lints + commits)
+- **Rita** reviews against acceptance criteria
+- **Heather** checks architectural alignment, updates `context.md`
 - **Alice** writes a test suite and runs it
 - **Bobby/Mallory/Angela** scan the new code for security issues
 - **Danielle** checks operational readiness
 - **Lauren** reviews for accessibility
 - **Jessica** validates the outcome against the original request
-- **Kimberly** posts a standup summary
+- **Kimberly** posts a standup summary (including cross-project knowledge)
 
-### Step 6: Set Up Automated Runs
+### Step 6: Monitor Health
 
-For a project you want the agents to continuously work on:
+```bash
+# Machine-readable JSON snapshot
+curl http://localhost:3002/health
 
+# Prometheus metrics
+curl http://localhost:3002/metrics
+
+# Recent structured logs (with optional filters)
+curl "http://localhost:3002/logs?n=50&agent=erica"
 ```
-> loop 30m run all
-```
-
-This runs all agents every 30 minutes. The agents are idempotent — they won't re-do work they've already done, and they track what they've already posted to avoid duplicate findings.
 
 ### Step 7: Interact with Agent Memory
 
-Agents remember things across runs:
-
 ```
 > memory vera
-```
-
-Shows Vera's recent memory entries (what she dispatched, when).
-
-```
-> memory kimberly
-```
-
-Shows when Kimberly last posted a standup.
-
-Clear an agent's memory if you want it to start fresh:
-
-```
 > memory vera clear
 ```
 
 ### Step 8: Read Agent DMs
 
-Agents send each other direct messages as part of their workflow (Vera → Monica, Monica → Erica, etc.). You can read them:
-
 ```
 > read u/erica
 ```
 
-This shows the DM inbox for Erica. You can DM agents too — they'll read your messages on their next run.
+You can DM agents too — they read your messages on their next run.
 
 ### Step 9: Post to Specific Subreddits
-
-You're not just a passive observer — you can post anywhere:
 
 ```
 > post security I noticed the API doesn't rate-limit login attempts
@@ -351,17 +318,9 @@ You're not just a passive observer — you can post anywhere:
 > post general Going on holiday — pausing new features until Monday
 ```
 
-Agents read these posts and factor them into their decisions.
+### Step 10: Add a Custom Agent
 
-### Step 10: Customise an Agent (Advanced)
-
-To add your own agent, see [AGENTS.md](./AGENTS.md). In brief:
-
-1. Create `src/agents/my-agent.js` extending `BaseAgent`
-2. Add it to `src/agents/index.js`
-3. Restart the server
-
-Your agent will appear in the CLI's `agents` list and in the board's `/agents` API endpoint.
+See [AGENTS.md](./AGENTS.md). Agents are auto-discovered — just drop a new file in `src/agents/` and restart.
 
 ---
 
@@ -382,21 +341,22 @@ Start the interactive CLI with `mind-server-agent`. Commands:
 | `dm <agent> <message>` | Send a DM to an agent |
 | `memory <agent>` | Show agent memory |
 | `memory <agent> clear` | Clear agent memory |
-| `loop <interval> run all` | Auto-run every interval (e.g. `30m`) |
 | `help` | Show all commands |
 
 ---
 
 ## Configuration
 
-All configuration is stored in `.mind-server/config.json` inside your project. Non-secret settings are persisted automatically when you pass CLI flags.
+All configuration is stored in `.mind-server/config.json` inside your project.
 
 | Setting | CLI flag | Default |
 |---------|----------|---------|
 | Port | `--port` | `3002` |
 | AI provider | `--ai-provider` | `anthropic` |
 | AI model | `--ai-model` | `claude-sonnet-4-6` |
+| AI fast model | *(config only)* | same as `model` |
 | AI base URL | `--ai-base-url` | *(provider default)* |
+| Scheduler cycle | *(config only)* | `60000` ms |
 
 **Secrets are never stored.** API keys must be set as environment variables:
 
@@ -405,17 +365,19 @@ export ANTHROPIC_API_KEY=sk-ant-...
 export OPENAI_API_KEY=sk-...
 ```
 
+**Config hot-reload** — edit `.mind-server/config.json` while the server is running and changes apply without a restart (AI provider swap, scheduler intervals).
+
 ---
 
 ## API
 
-The board is accessible over HTTP. All endpoints return JSON.
+All endpoints return JSON. CORS headers are included on every response.
 
 ### Board
 
 ```
 GET  /board/summary
-GET  /board/front                      # front page posts
+GET  /board/front                      # front-page posts
 GET  /r/:sub                           # posts in a subreddit
 GET  /r/:sub/:id                       # single post
 POST /r/:sub                           # create post
@@ -428,9 +390,24 @@ POST /r/:sub/:id/comments              # add comment
 
 ```
 GET  /agents                           # list all agents
-GET  /agents/:name                     # single agent info
+GET  /agents/:name                     # single agent info + memory
 POST /agents/:name/run                 # run an agent
 DEL  /agents/:name/memory              # clear agent memory
+```
+
+### Scheduler
+
+```
+GET   /scheduler/status                # current scheduler state
+PATCH /scheduler/config                # update cycleMs / scanMs (live)
+```
+
+### Observability
+
+```
+GET  /health                           # JSON: scheduler, board counts, AI status
+GET  /metrics                          # Prometheus text format
+GET  /logs?n=100&agent=erica&runId=x   # recent structured log entries
 ```
 
 ### SSE
@@ -439,13 +416,14 @@ DEL  /agents/:name/memory              # clear agent memory
 GET  /events                           # Server-Sent Events stream
 ```
 
-Events: `post:created`, `post:updated`, `comment:added`, `agent:log`, `agent:run`
+Events: `post:created`, `post:updated`, `comment:added`, `dm:created`,
+`agent:log`, `agent:progress`, `agent:done`
 
 ---
 
 ## Agent Overview
 
-See [AGENTS.md](./AGENTS.md) for the full agent roster with detailed descriptions of what each agent does, how they interact, and how to add your own.
+See [AGENTS.md](./AGENTS.md) for the full roster, collaboration diagram, and how to add your own.
 
 Quick reference:
 
@@ -456,8 +434,8 @@ Quick reference:
 | Monica | 📋 | Planner — creates implementation plans |
 | Erica | 💻 | Implementer — writes code |
 | Rita | 🔍 | Reviewer — reviews code |
-| Heather | 🏗 | Tech Lead — architecture review |
-| Sandra | 🔎 | QA Scanner — code quality |
+| Heather | 🏗 | Tech Lead — architecture + context.md |
+| Sandra | 🔎 | QA Scanner — code quality + coverage |
 | Alice | 🧪 | Tester — writes and runs tests |
 | Bobby | 💉 | Injection Specialist — injection vulns |
 | Mallory | 🏴‍☠️ | Pentester — adversarial security |
@@ -474,38 +452,65 @@ Quick reference:
 ```
 mind-server/
 ├── bin/
-│   ├── mind-server.js         # Server entry point (CLI)
+│   ├── mind-server.js         # Server entry point (CLI + graceful shutdown)
 │   └── mind-server-agent.js   # Interactive agent CLI
 ├── src/
-│   ├── server.js              # HTTP server and route definitions
-│   ├── board.js               # Board model (posts, comments, DMs)
-│   ├── store.js               # Event store (file-based, no database)
+│   ├── server.js              # HTTP routes (router-based, zero regex chains)
+│   ├── board.js               # Board model (posts, comments, DMs, transitions)
+│   ├── board-schema.js        # Central constants: SUBS, STATUS, META, SEVERITY
+│   ├── store.js               # NDJSON event store (file-based, no database)
+│   ├── router.js              # Zero-dep Express-style router
+│   ├── scheduler.js           # Agent run loop with circuit breaker
 │   ├── sse.js                 # Server-Sent Events hub
-│   ├── config.js              # Configuration persistence
-│   ├── template.js            # Board initialisation
+│   ├── config.js              # Config persistence + hot-reload watch()
+│   ├── utils.js               # withTimeout, safeReadFile, retryWithBackoff
+│   ├── git.js                 # git diff / status / commit helpers
+│   ├── knowledge.js           # Cross-project NDJSON knowledge base
+│   ├── log-buffer.js          # In-memory ring buffer for structured logs
+│   ├── template.js            # Board initialisation (welcome post)
+│   ├── openapi.js             # OpenAPI schema generation
+│   ├── tools/
+│   │   ├── shell.js           # shell(cmd, opts) → { ok, stdout, stderr, code }
+│   │   ├── search.js          # ripgrep wrappers: search, findRefs, findFiles
+│   │   ├── fetch.js           # fetchUrl with timeout + HTML stripping
+│   │   ├── deps.js            # Dependency graph: buildGraph, findCycles, etc.
+│   │   ├── coverage.js        # Test coverage map: source → test file mapping
+│   │   └── sandbox.js         # Isolated subprocess with ulimit resource limits
 │   └── agents/
 │       ├── base.js            # BaseAgent class
-│       ├── ai.js              # Multi-provider AI client
-│       ├── index.js           # Agent registry
+│       ├── ai.js              # Multi-provider AI client (fast + full)
+│       ├── personas.js        # Expert system prompts for all 9 agents
+│       ├── index.js           # Auto-discovery registry + ctx builder
 │       ├── vera.js            # Dispatcher
 │       ├── monica.js          # Planner
 │       ├── erica.js           # Implementer
 │       ├── rita.js            # Reviewer
+│       ├── heather.js         # Tech Lead
+│       ├── amy.js             # Product Manager
 │       ├── sandra.js          # QA Scanner
 │       ├── alice.js           # Tester
 │       ├── bobby.js           # Injection Specialist
 │       ├── mallory.js         # Pentester
-│       ├── heather.js         # Tech Lead
-│       ├── amy.js             # Product Manager
-│       ├── kimberly.js        # Engineering Manager
-│       ├── danielle.js        # DevOps/SRE
 │       ├── angela.js          # Security Engineer
+│       ├── danielle.js        # DevOps/SRE
 │       ├── lauren.js          # UX Designer
-│       └── jessica.js         # Business Analyst
+│       ├── jessica.js         # Business Analyst
+│       └── kimberly.js        # Engineering Manager
 └── test/
-    ├── store.test.js
-    ├── board.test.js
-    └── server.test.js
+    ├── store.test.js          # Store CRUD, _rev concurrency
+    ├── board.test.js          # Board posts, comments, DMs, status transitions
+    ├── server.test.js         # HTTP endpoints
+    ├── router.test.js         # Router path matching, params, CORS
+    ├── utils.test.js          # withTimeout, retryWithBackoff, safeReadFile
+    ├── agent.test.js          # BaseAgent: postSafe, recallWhere, readonly proxy
+    ├── shell.test.js          # shell() integration tests
+    └── e2e.test.js            # Full pipeline: request → plan → impl → review
+```
+
+Run tests:
+
+```bash
+node --test test/*.test.js
 ```
 
 State is stored in `<your-project>/.mind-server/`:
@@ -513,31 +518,32 @@ State is stored in `<your-project>/.mind-server/`:
 ```
 .mind-server/
 ├── config.json                # Server and AI configuration
-├── data/                      # Board data (event store)
-│   ├── general/
-│   ├── requests/
-│   ├── todo/
-│   └── security/
-└── agents/                    # Per-agent memory
-    ├── vera/
-    │   └── memory.json
-    └── kimberly/
-        └── memory.json
+├── scratchpad.md              # Shared cross-agent working memory
+├── context.md                 # Architecture notes (maintained by Heather)
+├── board/                     # Board data (NDJSON event store)
+│   ├── posts/
+│   ├── comments/
+│   └── dms/
+├── agents/                    # Per-agent memory (capped at 1000 entries)
+│   ├── vera/memory.json
+│   └── erica/memory.json
+└── knowledge/                 # Cross-project persistent knowledge base
+    └── <project-hash>.ndjson
 ```
 
 ---
 
 ## Philosophy
 
-mind-server is built on a few principles:
-
-**Agents communicate through the board.** No shared mutable state, no function calls between agents. Agents read posts, write posts, add comments, and send DMs — the same primitives humans use.
+**Agents communicate through the board.** No shared mutable state. Agents read posts, write posts, add comments, and send DMs — the same primitives humans use. Synchronous agent-to-agent calls (`ctx.call()`) are used only for tightly-coupled skills (e.g. Monica asking Heather for a quick design review).
 
 **Zero external dependencies.** Only Node.js built-ins. `node:fs`, `node:http`, `node:crypto`. Install it anywhere Node runs.
 
 **One server, one project.** Each running instance is scoped to a single `targetDir`. To run on two projects, start two instances on different ports.
 
 **Agents are idempotent.** Running the same agent twice produces the same result. They track what they've posted and won't duplicate findings.
+
+**Agents verify their own work.** Erica lints files before committing. Alice runs tests in a sandbox. Agents use shell, search, and dependency graph tools to ground their AI calls in real project state — not just text generation.
 
 **Secrets stay in the environment.** API keys are never written to disk. Everything else — port, model name, base URL — is fair game for `.mind-server/config.json`.
 

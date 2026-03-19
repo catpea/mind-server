@@ -89,8 +89,8 @@ test('u/name subs work via subId encoding', async () => {
   await board.ensureSub('u/vera');
   const sub = await board.getSub('u/vera');
   assert.ok(sub);
-  // Stored ID has __ not /
-  assert.equal(sub.id, 'u__vera');
+  // Stored ID uses %2F encoding (changed from __ in Session 1)
+  assert.equal(sub.id, 'u%2Fvera');
 });
 
 test('summary returns counts by status', async () => {
@@ -105,4 +105,111 @@ test('listSubs restores real names', async () => {
   const subs = await board.listSubs();
   const vera = subs.find(s => s.name === 'u/vera');
   assert.ok(vera, 'u/vera sub should appear with slash');
+});
+
+// ── Status transition tests ────────────────────────────────────────────────────
+
+test('open → planned is valid', async () => {
+  const post = await board.createPost('transitions', { title: 'T-open-planned', author: 'test' });
+  const updated = await board.advanceStatus(post.id, 'planned');
+  assert.equal(updated.status, 'planned');
+});
+
+test('open → awaiting-approval is valid', async () => {
+  const post = await board.createPost('transitions', { title: 'T-open-awaiting', author: 'test' });
+  const updated = await board.advanceStatus(post.id, 'awaiting-approval');
+  assert.equal(updated.status, 'awaiting-approval');
+});
+
+test('open → in-progress is valid', async () => {
+  const post = await board.createPost('transitions', { title: 'T-open-ip', author: 'test' });
+  const updated = await board.advanceStatus(post.id, 'in-progress');
+  assert.equal(updated.status, 'in-progress');
+});
+
+test('planned → in-progress is valid', async () => {
+  const post = await board.createPost('transitions', { title: 'T-pl-ip', author: 'test' });
+  await board.advanceStatus(post.id, 'planned');
+  const updated = await board.advanceStatus(post.id, 'in-progress');
+  assert.equal(updated.status, 'in-progress');
+});
+
+test('in-progress → review is valid', async () => {
+  const post = await board.createPost('transitions', { title: 'T-ip-rv', author: 'test' });
+  await board.advanceStatus(post.id, 'in-progress');
+  const updated = await board.advanceStatus(post.id, 'review');
+  assert.equal(updated.status, 'review');
+});
+
+test('review → done is valid', async () => {
+  const post = await board.createPost('transitions', { title: 'T-rv-done', author: 'test' });
+  await board.advanceStatus(post.id, 'in-progress');
+  await board.advanceStatus(post.id, 'review');
+  const updated = await board.advanceStatus(post.id, 'done');
+  assert.equal(updated.status, 'done');
+});
+
+test('done → open (re-open) is valid', async () => {
+  const post = await board.createPost('transitions', { title: 'T-done-open', author: 'test' });
+  await board.advanceStatus(post.id, 'in-progress');
+  await board.advanceStatus(post.id, 'review');
+  await board.advanceStatus(post.id, 'done');
+  const updated = await board.advanceStatus(post.id, 'open');
+  assert.equal(updated.status, 'open');
+});
+
+test('open → wont-fix is valid', async () => {
+  const post = await board.createPost('transitions', { title: 'T-wont-fix', author: 'test' });
+  const updated = await board.advanceStatus(post.id, 'wont-fix');
+  assert.equal(updated.status, 'wont-fix');
+});
+
+test('wont-fix → open (re-open) is valid', async () => {
+  const post = await board.createPost('transitions', { title: 'T-wf-open', author: 'test' });
+  await board.advanceStatus(post.id, 'wont-fix');
+  const updated = await board.advanceStatus(post.id, 'open');
+  assert.equal(updated.status, 'open');
+});
+
+test('open → done is invalid (must go through review)', async () => {
+  const post = await board.createPost('transitions', { title: 'T-open-done-bad', author: 'test' });
+  await assert.rejects(
+    () => board.advanceStatus(post.id, 'done'),
+    /transition/i,
+  );
+});
+
+test('review → planned is invalid', async () => {
+  const post = await board.createPost('transitions', { title: 'T-rv-pl-bad', author: 'test' });
+  await board.advanceStatus(post.id, 'in-progress');
+  await board.advanceStatus(post.id, 'review');
+  await assert.rejects(
+    () => board.advanceStatus(post.id, 'planned'),
+    /transition/i,
+  );
+});
+
+test('done → in-progress is invalid', async () => {
+  const post = await board.createPost('transitions', { title: 'T-done-ip-bad', author: 'test' });
+  await board.advanceStatus(post.id, 'in-progress');
+  await board.advanceStatus(post.id, 'review');
+  await board.advanceStatus(post.id, 'done');
+  await assert.rejects(
+    () => board.advanceStatus(post.id, 'in-progress'),
+    /transition/i,
+  );
+});
+
+test('advanceStatus transition error message names both statuses', async () => {
+  const post = await board.createPost('transitions', { title: 'T-err-msg', author: 'test' });
+  let caught;
+  try {
+    await board.advanceStatus(post.id, 'done');
+  } catch (err) {
+    caught = err;
+  }
+  assert.ok(caught, 'should throw');
+  // Error format: 'Invalid transition: "open" → "done". Allowed from ...'
+  assert.match(caught.message, /"open"/);
+  assert.match(caught.message, /"done"/);
 });

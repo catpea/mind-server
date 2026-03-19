@@ -21,8 +21,10 @@
  */
 
 import { BaseAgent } from './base.js';
+import { SUBS, STATUS, META, AMY_STATUS } from '../board-schema.js';
 
 export class Vera extends BaseAgent {
+  static priority = 2;
   name        = 'vera';
   description = 'Dispatcher and orchestrator. Reads the board and coordinates the team.';
   avatar      = '🦉';
@@ -30,8 +32,9 @@ export class Vera extends BaseAgent {
 
   async think(ctx) {
     const { board } = ctx;
-    const summary   = await board.summary();
-    const recent    = await this.recall(10);
+    const summary    = await board.summary();
+    const recent     = await this.recall(10);
+    const scratchpad = await this.readScratchpad();
 
     // Count actionable states
     const open       = summary.byStatus.open        ?? 0;
@@ -40,14 +43,24 @@ export class Vera extends BaseAgent {
     const review     = summary.byStatus.review       ?? 0;
     const done       = summary.byStatus.done         ?? 0;
 
-    // Get request posts (unplanned user requests)
-    const requestPosts = await board.getPosts('requests').catch(() => []);
-    const unplanned    = requestPosts.filter(p => p.status === 'open');
+    // Get request posts
+    const requestPosts   = await board.getPosts(SUBS.REQUESTS).catch(() => []);
+    const unreviewed     = requestPosts.filter(p => p.status === STATUS.OPEN && !p.meta?.[META.AMY_REVIEWED]);
+    const readyToplan    = requestPosts.filter(p => p.status === STATUS.OPEN && p.meta?.[META.AMY_STATUS] === AMY_STATUS.APPROVED);
 
-    // Get todo posts
-    const todoPosts = await board.getPosts('todo').catch(() => []);
-    const needsWork = todoPosts.filter(p => ['open', 'planned'].includes(p.status));
-    const inReview  = todoPosts.filter(p => p.status === 'review');
+    // Get todo posts (skip wont-fix)
+    const todoPosts  = await board.getPosts(SUBS.TODO).catch(() => []);
+    const needsWork  = todoPosts.filter(p => [STATUS.APPROVED, STATUS.OPEN, STATUS.PLANNED].includes(p.status));
+    const inReview   = todoPosts.filter(p => p.status === STATUS.REVIEW);
+    const gated      = ctx.gated ?? true;
+
+    // Agents with pending DM questions they need to answer — conversations in flight
+    const allDms      = await board.getDMs({}).catch(() => []);
+    const unanswered  = allDms.filter(d => d.meta?.requiresReply && !d.read);
+    // Group by recipient: { agentName → count }
+    const pendingFor  = {};
+    for (const dm of unanswered) pendingFor[dm.to] = (pendingFor[dm.to] ?? 0) + 1;
+    const conversationAgents = Object.keys(pendingFor); // agents that have questions waiting
 
     // When was Sandra last active?
     const lastScan = recent.find(m => m.content?.dispatch === 'sandra');
@@ -58,26 +71,41 @@ export class Vera extends BaseAgent {
     let dispatch = null;
     let reason   = '';
 
-    if (ctx.ai.isAvailable()) {
-      // Let Claude decide
+    // Conversations in flight take highest priority — dispatch whoever has a pending question
+    if (conversationAgents.length > 0) {
+      dispatch = conversationAgents[0];
+      const asker = unanswered.find(d => d.to === dispatch)?.from ?? 'a peer';
+      reason   = `${asker} is waiting for a reply from ${dispatch} (${pendingFor[dispatch]} question(s))`;
+    }
+
+    if (!dispatch && ctx.ai.isAvailable()) {
       const recentStr = recent.map(m => `${m.timestamp}: ${m.type} ${JSON.stringify(m.content)}`).join('\n');
+      const pendingStr = conversationAgents.length
+        ? `\n- Active DM conversations waiting for reply: ${conversationAgents.map(a => `${a}(${pendingFor[a]})`).join(', ')}`
+        : '';
+      const scratchSection = scratchpad
+        ? `\n## Shared Scratchpad (agent working notes)\n${scratchpad.slice(0, 1000)}\n`
+        : '';
+
       const prompt = `You are Vera, the dispatcher for a software development team of AI agents.
 
 Board state:
-- Unplanned requests (needs Monica): ${unplanned.length}
+- Requests needing Amy's review: ${unreviewed.length}
+- Requests approved for planning (needs Monica): ${readyToplan.length}
 - Todo items needing implementation (needs Erica): ${needsWork.length}
 - Items in review (needs Rita): ${inReview.length}
 - Hours since last quality scan: ${hoursSinceScan.toFixed(1)}
+- Approval gate active: ${gated}${pendingStr}
 
 Your recent actions:
-${recentStr || '(none)'}
+${recentStr || '(none)'}${scratchSection}
 
-Agents available: monica (planner), erica (implementer), rita (reviewer), sandra (QA scanner)
+Agents available: amy (PM/triage), monica (planner), erica (implementer), rita (reviewer), sandra (QA scanner)
 
 Respond with JSON: { "dispatch": "<agentName or null>", "reason": "<one sentence>" }
 Dispatch null if all is idle or you dispatched this agent recently.`;
 
-      const result = await ctx.ai.askJSON(prompt, { system: 'You coordinate a software development team. Reply with only JSON.' });
+      const result = await ctx.ai.fast.askJSON(prompt, { system: 'You are Vera, an orchestrator. Pick the right agent to run next. Reply with only JSON.' });
       if (result) {
         dispatch = result.dispatch;
         reason   = result.reason;
@@ -86,10 +114,11 @@ Dispatch null if all is idle or you dispatched this agent recently.`;
 
     // Heuristic fallback
     if (!dispatch) {
-      if (unplanned.length > 0)       { dispatch = 'monica';  reason = `${unplanned.length} unplanned request(s)`; }
-      else if (needsWork.length > 0)  { dispatch = 'erica';   reason = `${needsWork.length} todo(s) need implementation`; }
-      else if (inReview.length > 0)   { dispatch = 'rita';    reason = `${inReview.length} item(s) in review`; }
-      else if (hoursSinceScan > 2)    { dispatch = 'sandra';  reason = `no quality scan in ${hoursSinceScan.toFixed(0)}h`; }
+      if (unreviewed.length > 0)      { dispatch = 'amy';    reason = `${unreviewed.length} unreviewed request(s)`; }
+      else if (readyToplan.length > 0){ dispatch = 'monica'; reason = `${readyToplan.length} approved request(s) ready to plan`; }
+      else if (needsWork.length > 0)  { dispatch = 'erica';  reason = `${needsWork.length} todo(s) need implementation`; }
+      else if (inReview.length > 0)   { dispatch = 'rita';   reason = `${inReview.length} item(s) in review`; }
+      else if (hoursSinceScan > 2)    { dispatch = 'sandra'; reason = `no quality scan in ${hoursSinceScan.toFixed(0)}h`; }
     }
 
     return { dispatch, reason, summary };
@@ -107,8 +136,8 @@ Dispatch null if all is idle or you dispatched this agent recently.`;
     this.log(`dispatching ${plan.dispatch} — ${plan.reason}`, ctx);
 
     // Post a dispatch notice so humans can see what's happening
-    await board.ensureSub('dispatch');
-    const post = await board.createPost('dispatch', {
+    await board.ensureSub(SUBS.DISPATCH);
+    const post = await board.createPost(SUBS.DISPATCH, {
       title:  `Dispatch: ${plan.dispatch}`,
       body:   plan.reason,
       author: this.name,
@@ -121,7 +150,7 @@ Dispatch null if all is idle or you dispatched this agent recently.`;
       to:      plan.dispatch,
       subject: 'Run request',
       body:    plan.reason,
-      meta:    { dispatchPostId: post.id },
+      meta:    { [META.DISPATCH_POST_ID]: post.id },
     });
 
     await this.remember('dispatch', { dispatch: plan.dispatch, reason: plan.reason });

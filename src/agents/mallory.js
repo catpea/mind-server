@@ -24,6 +24,7 @@ import { BaseAgent }               from './base.js';
 import { readFile, readdir }       from 'node:fs/promises';
 import { existsSync }              from 'node:fs';
 import { join, extname, relative } from 'node:path';
+import { SUBS, META }              from '../board-schema.js';
 
 // Patterns that suggest hardcoded secrets
 const SECRET_PATTERNS = [
@@ -34,28 +35,25 @@ const SECRET_PATTERNS = [
 ];
 
 export class Mallory extends BaseAgent {
+  static priority = 10;
   name        = 'mallory';
   description = 'Pentester. Adversarial security review: secrets, auth, OWASP Top 10, attack surface analysis.';
   avatar      = '🏴‍☠️';
   role        = 'pentester';
 
   async think(ctx) {
-    const { targetDir, board } = ctx;
+    const { targetDir } = ctx;
 
-    const files    = await this.#collectFiles(targetDir);
-    const existing = (await board.getPosts('security').catch(() => []))
-      .filter(p => p.status !== 'done' && p.author === this.name)
-      .map(p => p.title);
-
-    return { files, existing, targetDir };
+    const files = await this.#collectFiles(targetDir);
+    return { files, targetDir };
   }
 
   async act(plan, ctx) {
-    const { board }                = ctx;
-    const { files, existing, targetDir } = plan;
-    const actions                  = [];
+    const { board }          = ctx;
+    const { files, targetDir } = plan;
+    const actions            = [];
 
-    await board.ensureSub('security');
+    await board.ensureSub(SUBS.SECURITY);
     this.log('starting adversarial security review', ctx);
 
     const findings = [];
@@ -98,16 +96,14 @@ export class Mallory extends BaseAgent {
     }
 
     // ── Post new findings ────────────────────────────────────────────────────
-    const seen = new Set(existing);
     for (const finding of findings) {
-      if (seen.has(finding.title)) continue;
-      seen.add(finding.title);
-      await board.createPost('security', {
+      if (await this.findDuplicate(board, SUBS.SECURITY, finding.title)) continue;
+      await board.createPost(SUBS.SECURITY, {
         title:  finding.title,
         body:   finding.body,
         author: this.name,
         type:   'quality',
-        meta:   { severity: finding.severity, threatLevel: finding.threatLevel },
+        meta:   { [META.SEVERITY]: finding.severity, [META.THREAT_LEVEL]: finding.threatLevel },
       });
       this.log(`[${finding.threatLevel}] ${finding.title}`, ctx);
       actions.push({ type: 'finding', title: finding.title, level: finding.threatLevel });

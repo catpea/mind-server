@@ -20,6 +20,7 @@ import { BaseAgent }               from './base.js';
 import { readFile, readdir, stat } from 'node:fs/promises';
 import { existsSync }              from 'node:fs';
 import { join, extname }          from 'node:path';
+import { SUBS, META, SEVERITY }   from '../board-schema.js';
 
 const OPS_SIGNALS = [
   { file: 'Dockerfile',              label: 'Dockerfile',          severity: 'warning' },
@@ -32,17 +33,14 @@ const OPS_SIGNALS = [
 ];
 
 export class Danielle extends BaseAgent {
+  static priority = 12;
   name        = 'danielle';
   description = 'DevOps/SRE. Deployment readiness, CI/CD, observability, operational hygiene.';
   avatar      = '🚀';
   role        = 'devops-sre';
 
   async think(ctx) {
-    const { targetDir, board } = ctx;
-
-    const existing = (await board.getPosts('ops').catch(() => []))
-      .filter(p => p.status !== 'done' && p.author === this.name)
-      .map(p => p.title);
+    const { targetDir } = ctx;
 
     // What infrastructure files exist?
     const infraFound = [];
@@ -66,15 +64,15 @@ export class Danielle extends BaseAgent {
     // Scan source files for env/logging patterns
     const sourceFiles = await this.#collectFiles(targetDir);
 
-    return { existing, infraFound, infraMissing, pkg, sourceFiles, targetDir };
+    return { infraFound, infraMissing, pkg, sourceFiles, targetDir };
   }
 
   async act(plan, ctx) {
     const { board }                                             = ctx;
-    const { existing, infraFound, infraMissing, pkg, sourceFiles, targetDir } = plan;
+    const { infraFound, infraMissing, pkg, sourceFiles, targetDir } = plan;
     const actions                                              = [];
 
-    await board.ensureSub('ops');
+    await board.ensureSub(SUBS.OPS);
     this.log('checking deployment readiness', ctx);
 
     const findings = [];
@@ -124,6 +122,12 @@ export class Danielle extends BaseAgent {
       } catch { /* skip */ }
     }
 
+    // ── Start check: does the project actually start? ─────────────────────────
+    if (pkg?.scripts?.start) {
+      const startResult = await this.#checkProjectStarts(ctx);
+      if (startResult) findings.push(startResult);
+    }
+
     // ── AI operational review ─────────────────────────────────────────────────
     if (ctx.ai.isAvailable() && pkg) {
       const aiFindings = await this.#aiOpsReview(pkg, infraFound, infraMissing, sourceFiles, ctx);
@@ -131,16 +135,14 @@ export class Danielle extends BaseAgent {
     }
 
     // ── Post new findings ─────────────────────────────────────────────────────
-    const seen = new Set(existing);
     for (const f of findings) {
-      if (seen.has(f.title)) continue;
-      seen.add(f.title);
-      await board.createPost('ops', {
+      if (await this.findDuplicate(board, SUBS.OPS, f.title)) continue;
+      await board.createPost(SUBS.OPS, {
         title:  f.title,
         body:   f.body,
         author: this.name,
         type:   'quality',
-        meta:   { severity: f.severity },
+        meta:   { [META.SEVERITY]: f.severity },
       });
       this.log(`[ops] ${f.title}`, ctx);
       actions.push({ type: 'finding', title: f.title });
@@ -196,6 +198,26 @@ Respond with a JSON array (may be empty):
       { system: 'You are a senior SRE. Focus on operational risk. Reply with JSON only.' }
     );
     return Array.isArray(result) ? result.slice(0, 3) : [];
+  }
+
+  /**
+   * Try to start the project with a 5-second timeout. If it crashes immediately
+   * (exit code non-zero before timeout), report it as an ops finding.
+   * If it's still running at timeout, that's healthy — kill and report OK.
+   */
+  async #checkProjectStarts(ctx) {
+    const result = await ctx.tools.shell('npm start', { timeout: 5_000 });
+
+    // If the process exited (not a timeout kill) with non-zero code — it crashed
+    if (!result.ok && result.code !== null) {
+      return {
+        title:    '[OPS] Project fails to start',
+        body:     `\`npm start\` exited with code ${result.code} within 5 seconds.\n\n\`\`\`\n${(result.stderr || result.stdout).slice(0, 1000)}\n\`\`\`\n\n**Fix:** Investigate the startup error above.`,
+        severity: 'error',
+      };
+    }
+    // Timeout (code === null, process killed) means it ran — good
+    return null;
   }
 
   async #collectFiles(targetDir) {

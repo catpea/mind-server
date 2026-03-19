@@ -22,8 +22,13 @@
  */
 
 import { BaseAgent }               from './base.js';
-import { readFile, readdir }       from 'node:fs/promises';
-import { join, extname, relative } from 'node:path';
+import { readFile }                from 'node:fs/promises';
+import { existsSync }              from 'node:fs';
+import { join }                    from 'node:path';
+import { homedir }                 from 'node:os';
+import { SUBS, META }              from '../board-schema.js';
+import { PERSONAS }                from './personas.js';
+import { Knowledge }               from '../knowledge.js';
 
 // ── Dangerous pattern catalogue ────────────────────────────────────────────────
 
@@ -39,28 +44,46 @@ const PATTERNS = [
 ];
 
 export class Bobby extends BaseAgent {
+  static priority = 9;
   name        = 'bobby';
   description = 'Injection specialist. Hunts command, SQL, XSS, path-traversal, and eval vulnerabilities in source code.';
   avatar      = '💉';
   role        = 'security-injection';
 
+  #kb = new Knowledge(homedir());
+
+  skills = {
+    scanFile: async ({ path }, ctx) => {
+      const abs     = join(ctx.targetDir, path);
+      const content = await readFile(abs, 'utf8').catch(() => '');
+      if (!content) return { findings: [] };
+      const findings = this.#patternScan(path, content);
+      return { findings };
+    },
+  };
+
   async think(ctx) {
-    const { targetDir, board } = ctx;
+    const sourceFiles = await this.#collectSourceFiles(ctx);
 
-    const sourceFiles = await this.#collectSourceFiles(targetDir);
-    const existing    = (await board.getPosts('security', { type: 'quality' }).catch(() => []))
-      .filter(p => p.status !== 'done' && p.author === this.name)
-      .map(p => p.title);
+    // Read package.json for known dependencies — used for CVE lookup
+    let packages = {};
+    const pkgPath = join(ctx.targetDir, 'package.json');
+    if (existsSync(pkgPath)) {
+      try {
+        const pkg = JSON.parse(await readFile(pkgPath, 'utf8'));
+        packages = { ...(pkg.dependencies ?? {}), ...(pkg.devDependencies ?? {}) };
+      } catch { /* skip */ }
+    }
 
-    return { sourceFiles, existing };
+    return { sourceFiles, packages };
   }
 
   async act(plan, ctx) {
     const { board }             = ctx;
-    const { sourceFiles, existing } = plan;
+    const { sourceFiles, packages } = plan;
     const actions               = [];
 
-    await board.ensureSub('security');
+    await board.ensureSub(SUBS.SECURITY);
     this.log(`scanning ${sourceFiles.length} source files for injection patterns`, ctx);
 
     const findings = [];
@@ -79,20 +102,41 @@ export class Bobby extends BaseAgent {
       } catch { /* skip unreadable */ }
     }
 
-    // Deduplicate by title
-    const seen = new Set(existing);
     for (const f of findings) {
-      if (seen.has(f.title)) continue;
-      seen.add(f.title);
-      await board.createPost('security', {
+      if (await this.findDuplicate(board, SUBS.SECURITY, f.title)) continue;
+      // Write security pattern to knowledge base before posting
+      await this.#kb.write({
+        projectDir: ctx.targetDir,
+        agentName:  this.name,
+        type:       'security',
+        title:      f.title,
+        body:       f.body.slice(0, 500),
+        tags:       ['security', (f.id?.toLowerCase() ?? 'vuln')],
+      }).catch(() => {});
+      await board.createPost(SUBS.SECURITY, {
         title:  f.title,
         body:   f.body,
         author: this.name,
         type:   'quality',
-        meta:   { severity: f.severity, vulnClass: f.id },
+        meta:   { [META.SEVERITY]: f.severity, vulnClass: f.id },
       });
       this.log(`found: ${f.title}`, ctx);
       actions.push({ type: 'vuln-posted', title: f.title, severity: f.severity });
+    }
+
+    // CVE lookup via osv.dev for known packages
+    const cveFindings = await this.#lookupCVEs(packages, ctx);
+    for (const f of cveFindings) {
+      if (await this.findDuplicate(board, SUBS.SECURITY, f.title)) continue;
+      await board.createPost(SUBS.SECURITY, {
+        title:  f.title,
+        body:   f.body,
+        author: this.name,
+        type:   'quality',
+        meta:   { [META.SEVERITY]: f.severity, vulnClass: 'CVE' },
+      });
+      this.log(`CVE: ${f.title}`, ctx);
+      actions.push({ type: 'cve-posted', title: f.title });
     }
 
     if (!actions.length) this.log('no new injection vulnerabilities found', ctx);
@@ -135,20 +179,51 @@ export class Bobby extends BaseAgent {
 
   async #aiScan(filepath, content, ctx) {
     const result = await ctx.ai.askJSON(
-      `You are Bobby, a code injection specialist.
-Analyse this file for injection vulnerabilities — command injection, SQL injection, XSS, path traversal, eval, SSRF, prototype pollution.
-Only report real, exploitable issues. Skip false positives.
-
+      `Analyse this file for injection vulnerabilities.
 File: ${filepath}
 \`\`\`
 ${content.slice(0, 3000)}
 \`\`\`
 
-Respond with a JSON array (may be empty):
-[{ "title": "Short issue title", "body": "Explanation + remediation steps", "severity": "error|warning", "id": "VULN-CLASS" }]`,
-      { system: 'You are a security engineer. Report only real vulnerabilities. Reply with JSON only.' }
+Only report real, exploitable issues with file:line references. Skip false positives.
+Respond with JSON array (may be empty):
+[{ "title": "Short issue title", "body": "Explanation + remediation", "severity": "error|warning", "id": "VULN-CLASS" }]`,
+      { system: PERSONAS.bobby }
     );
     return Array.isArray(result) ? result.slice(0, 5) : [];
+  }
+
+  /**
+   * Query osv.dev for known CVEs in project dependencies.
+   * Checks up to 5 packages to stay within rate limits.
+   */
+  async #lookupCVEs(packages, ctx) {
+    const findings = [];
+    const names    = Object.keys(packages).slice(0, 5);
+
+    for (const name of names) {
+      try {
+        const result = await ctx.tools.fetch('https://api.osv.dev/v1/query', {
+          method: 'POST',
+          json:   { package: { name, ecosystem: 'npm' } },
+        });
+        if (!result.ok || !result.json?.vulns?.length) continue;
+
+        const vulns = result.json.vulns.slice(0, 3);
+        for (const v of vulns) {
+          const id       = v.id ?? 'CVE-?';
+          const summary  = v.summary ?? 'Known vulnerability';
+          const severity = v.database_specific?.severity?.toLowerCase() === 'critical' ? 'error' : 'warning';
+          findings.push({
+            title:    `[CVE] ${name}: ${id}`,
+            body:     `**Package:** \`${name}\` (${packages[name]})\n**ID:** ${id}\n**Summary:** ${summary}\n\n**Action:** Run \`npm audit fix\` or upgrade to a patched version.`,
+            severity,
+          });
+        }
+      } catch { /* skip — network not available */ }
+    }
+
+    return findings;
   }
 
   #remediation(id) {
@@ -165,24 +240,12 @@ Respond with a JSON array (may be empty):
     return map[id] ?? 'Review and sanitise all user input at the point of use.';
   }
 
-  async #collectSourceFiles(targetDir) {
-    const exts   = new Set(['.js', '.mjs', '.ts', '.py', '.php', '.rb']);
-    const ignore = new Set(['.mind-server', '.git', 'node_modules', 'dist', 'test', 'tests']);
-    const files  = [];
-
-    async function walk(dir) {
-      let entries;
-      try { entries = await readdir(dir, { withFileTypes: true }); } catch { return; }
-      for (const e of entries) {
-        if (ignore.has(e.name)) continue;
-        if (e.isDirectory()) { await walk(join(dir, e.name)); continue; }
-        if (exts.has(extname(e.name))) {
-          files.push({ abs: join(dir, e.name), rel: relative(targetDir, join(dir, e.name)) });
-        }
-      }
-    }
-
-    await walk(targetDir);
-    return files.slice(0, 20); // cap for performance
+  async #collectSourceFiles(ctx) {
+    const { targetDir, tools } = ctx;
+    const paths = await tools.findFiles('**/*.{js,mjs,ts,py,php,rb}');
+    return paths
+      .filter(p => !/test|spec|node_modules|dist|\.mind-server/.test(p))
+      .slice(0, 20)
+      .map(rel => ({ abs: join(targetDir, rel), rel }));
   }
 }

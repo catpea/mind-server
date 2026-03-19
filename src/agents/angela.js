@@ -21,6 +21,7 @@ import { BaseAgent }               from './base.js';
 import { readFile, readdir }       from 'node:fs/promises';
 import { existsSync }              from 'node:fs';
 import { join, extname, relative } from 'node:path';
+import { SUBS, META }              from '../board-schema.js';
 
 // Cryptographic anti-patterns
 const CRYPTO_PATTERNS = [
@@ -31,18 +32,16 @@ const CRYPTO_PATTERNS = [
 ];
 
 export class Angela extends BaseAgent {
+  static priority = 11;
   name        = 'angela';
   description = 'Security Engineer. Defensive posture: auth controls, crypto hygiene, input validation, dependency health.';
   avatar      = '🛡';
   role        = 'security-engineer';
 
   async think(ctx) {
-    const { targetDir, board } = ctx;
+    const { targetDir } = ctx;
 
-    const files    = await this.#collectFiles(targetDir);
-    const existing = (await board.getPosts('security').catch(() => []))
-      .filter(p => p.status !== 'done' && p.author === this.name)
-      .map(p => p.title);
+    const files = await this.#collectFiles(targetDir);
 
     // Read package.json for dependency analysis
     let pkg = null;
@@ -51,15 +50,15 @@ export class Angela extends BaseAgent {
       try { pkg = JSON.parse(await readFile(pkgPath, 'utf8')); } catch { /* skip */ }
     }
 
-    return { files, existing, pkg, targetDir };
+    return { files, pkg, targetDir };
   }
 
   async act(plan, ctx) {
     const { board }                    = ctx;
-    const { files, existing, pkg, targetDir } = plan;
+    const { files, pkg, targetDir } = plan;
     const actions                      = [];
 
-    await board.ensureSub('security');
+    await board.ensureSub(SUBS.SECURITY);
     this.log('running defensive security review', ctx);
 
     const findings = [];
@@ -92,16 +91,14 @@ export class Angela extends BaseAgent {
     }
 
     // ── Post new findings ─────────────────────────────────────────────────────
-    const seen = new Set(existing);
     for (const finding of findings) {
-      if (seen.has(finding.title)) continue;
-      seen.add(finding.title);
-      await board.createPost('security', {
+      if (await this.findDuplicate(board, SUBS.SECURITY, finding.title)) continue;
+      await board.createPost(SUBS.SECURITY, {
         title:  finding.title,
         body:   finding.body,
         author: this.name,
         type:   'quality',
-        meta:   { severity: finding.severity, threatLevel: finding.threatLevel },
+        meta:   { [META.SEVERITY]: finding.severity, [META.THREAT_LEVEL]: finding.threatLevel },
       });
       this.log(`[${finding.threatLevel}] ${finding.title}`, ctx);
       actions.push({ type: 'finding', title: finding.title, level: finding.threatLevel });

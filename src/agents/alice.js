@@ -10,37 +10,39 @@
  */
 
 import { BaseAgent }                    from './base.js';
-import { readFile, readdir, writeFile } from 'node:fs/promises';
+import { readFile, writeFile }          from 'node:fs/promises';
 import { existsSync }                   from 'node:fs';
-import { join, extname, basename }      from 'node:path';
-import { exec }                         from 'node:child_process';
-import { promisify }                    from 'node:util';
-
-const execAsync = promisify(exec);
+import { join, basename }               from 'node:path';
+import { SUBS, STATUS, META, SEVERITY } from '../board-schema.js';
 
 export class Alice extends BaseAgent {
+  static priority = 8;
   name        = 'alice';
   description = 'Friendly tester. Writes test suites for implemented code, runs them, and reports results.';
   avatar      = '🧪';
   role        = 'tester';
+  readonly    = false;
 
   async think(ctx) {
-    const { board, targetDir } = ctx;
+    const { board } = ctx;
 
     // Find recently implemented todos (status = done or review, has Erica comment)
     const todos = await board.getAllPosts({ type: 'todo' }).catch(() => []);
     const needsTests = todos.filter(p =>
-      ['review', 'done'].includes(p.status) &&
-      !p.meta?.aliceTested
+      [STATUS.REVIEW, STATUS.DONE].includes(p.status) &&
+      !p.meta?.[META.ALICE_TESTED]
     );
 
-    // Find source files without companion test files
-    const untested = await this.#findUntestedFiles(targetDir);
+    // Coverage map — prioritise genuinely untested files (not random picks)
+    const coverage = await ctx.tools.buildCoverageMap().catch(() => null);
+    const untested = coverage
+      ? coverage.uncovered.slice(0, 10)
+      : await this.#findUntestedFiles(ctx);
 
     // Recent test failures from board
-    const testPosts = await board.getPosts('tests', { status: 'open' }).catch(() => []);
+    const testPosts = await board.getPosts(SUBS.TESTS, { status: STATUS.OPEN }).catch(() => []);
 
-    return { needsTests, untested, testPosts };
+    return { needsTests, untested, testPosts, coverage };
   }
 
   async act(plan, ctx) {
@@ -48,28 +50,12 @@ export class Alice extends BaseAgent {
     const { needsTests, untested } = plan;
     const actions = [];
 
-    await board.ensureSub('tests');
+    await board.ensureSub(SUBS.TESTS);
 
-    // Run existing tests first
-    const testResult = await this.#runTests(targetDir);
-    if (testResult) {
-      this.log(`tests: ${testResult.passed} passed, ${testResult.failed} failed`, ctx);
-      if (testResult.failed > 0) {
-        await board.createPost('tests', {
-          title:  `Test failures: ${testResult.failed} failing`,
-          body:   testResult.output.slice(0, 2000),
-          author: this.name,
-          type:   'quality',
-          meta:   { severity: 'error', passed: testResult.passed, failed: testResult.failed },
-        });
-        actions.push({ type: 'test-failure-posted', failed: testResult.failed });
-      }
-    }
-
-    // Write missing tests with AI
+    // Write missing tests with AI — one todo at a time
     if (ctx.ai.isAvailable() && needsTests.length > 0) {
-      const todo = needsTests[0]; // one at a time
-      const filesWritten = todo.meta?.filesWritten ?? [];
+      const todo = needsTests[0];
+      const filesWritten = todo.meta?.[META.FILES_WRITTEN] ?? [];
       for (const filepath of filesWritten.slice(0, 2)) {
         const abs = join(targetDir, filepath);
         if (!existsSync(abs)) continue;
@@ -84,26 +70,59 @@ export class Alice extends BaseAgent {
           actions.push({ type: 'tests-written', file: testPath });
         }
       }
-      // Mark as tested
-      await board.updatePost(todo.id, { meta: { ...todo.meta, aliceTested: true } });
+      await board.updatePost(todo.id, { meta: { ...todo.meta, [META.ALICE_TESTED]: true } });
+    }
+
+    // Run all tests — if failures, send the todo back to Erica
+    const testResult = await this.#runTests(ctx);
+    if (testResult) {
+      this.log(`tests: ${testResult.passed} passed, ${testResult.failed} failed`, ctx);
+      if (testResult.failed > 0) {
+        // Find the most recently reviewed todo to bounce back
+        const inReview = (await board.getPosts(SUBS.TODO, { status: STATUS.REVIEW }).catch(() => []))
+          .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+
+        if (inReview.length > 0) {
+          const todo = inReview[0];
+          await board.addComment(todo.id, {
+            author: this.name,
+            body:   `🧪 Alice ran tests — **${testResult.failed} failure(s)**. Bouncing back to Erica.\n\n\`\`\`\n${testResult.output.slice(0, 2000)}\n\`\`\``,
+          });
+          await board.advanceStatus(todo.id, STATUS.IN_PROGRESS, {
+            author: this.name, comment: 'Tests failed — returning to Erica for fixes.',
+          });
+          actions.push({ type: 'bounced-to-erica', todoId: todo.id, failed: testResult.failed });
+        } else {
+          // No linked todo — post to tests sub
+          if (!await this.findDuplicate(board, SUBS.TESTS, `Test failures`)) {
+            await board.ensureSub(SUBS.TESTS);
+            await board.createPost(SUBS.TESTS, {
+              title:  `Test failures: ${testResult.failed} failing`,
+              body:   testResult.output.slice(0, 2000),
+              author: this.name,
+              type:   'quality',
+              meta:   { [META.SEVERITY]: SEVERITY.ERROR, passed: testResult.passed, failed: testResult.failed },
+            });
+          }
+          actions.push({ type: 'test-failure-posted', failed: testResult.failed });
+        }
+      }
     }
 
     // Flag untested files (no AI needed)
     if (untested.length > 0) {
-      const openTitles = (await board.getPosts('quality').catch(() => []))
-        .filter(p => p.status !== 'done').map(p => p.title);
-
       for (const f of untested.slice(0, 3)) {
         const title = `No tests for ${f}`;
-        if (openTitles.includes(title)) continue;
-        await board.createPost('quality', {
-          title,
-          body:   `\`${f}\` has no corresponding test file. Add tests to verify correctness.`,
-          author: this.name,
-          type:   'quality',
-          meta:   { severity: 'warning', file: f },
-        });
-        actions.push({ type: 'untested-flagged', file: f });
+        if (!await this.findDuplicate(board, SUBS.QUALITY, title)) {
+          await board.createPost(SUBS.QUALITY, {
+            title,
+            body:   `\`${f}\` has no corresponding test file. Add tests to verify correctness.`,
+            author: this.name,
+            type:   'quality',
+            meta:   { [META.SEVERITY]: SEVERITY.WARNING, file: f },
+          });
+          actions.push({ type: 'untested-flagged', file: f });
+        }
       }
     }
 
@@ -115,47 +134,40 @@ export class Alice extends BaseAgent {
     return { outcome: 'tested', count: actions.length, actions };
   }
 
-  async #runTests(targetDir) {
+  async #runTests(ctx) {
+    const { targetDir, tools } = ctx;
     const pkgPath = join(targetDir, 'package.json');
     if (!existsSync(pkgPath)) return null;
     try {
       const pkg = JSON.parse(await readFile(pkgPath, 'utf8'));
       if (!pkg.scripts?.test || pkg.scripts.test.includes('no test')) return null;
-      const { stdout, stderr } = await execAsync('npm test', { cwd: targetDir, timeout: 30_000 });
-      const output   = (stdout + stderr).slice(0, 4000);
-      const passed   = (output.match(/✔|pass/gi) ?? []).length;
-      const failed   = (output.match(/✗|fail|error/gi) ?? []).length;
-      return { passed, failed, output };
-    } catch (err) {
-      const output = String(err.stdout ?? '') + String(err.stderr ?? '');
-      return { passed: 0, failed: 1, output: output.slice(0, 2000) };
-    }
+    } catch { return null; }
+
+    const result = await tools.shell('npm test', { timeout: 60_000 });
+    const output = `${result.stdout}\n${result.stderr}`.trim().slice(0, 4000);
+    const passed = (output.match(/✔|pass/gi) ?? []).length;
+    const failed = (output.match(/✗|fail|error/gi) ?? []).length;
+    return { passed, failed, output, ok: result.ok };
   }
 
-  async #findUntestedFiles(targetDir) {
-    const sourceExts  = new Set(['.js', '.mjs', '.ts']);
+  async #findUntestedFiles(ctx) {
+    const { targetDir, tools } = ctx;
+
+    // Use search tool to find all source files
+    const sourceFiles = await tools.findFiles('**/*.{js,mjs,ts}');
     const testPattern = /test|spec/i;
-    const ignore      = new Set(['.mind-server', '.git', 'node_modules', 'dist']);
     const untested    = [];
 
-    async function walk(dir) {
-      let entries;
-      try { entries = await readdir(dir, { withFileTypes: true }); } catch { return; }
-      for (const e of entries) {
-        if (ignore.has(e.name)) continue;
-        if (e.isDirectory()) { await walk(join(dir, e.name)); continue; }
-        if (!sourceExts.has(extname(e.name))) continue;
-        if (testPattern.test(e.name)) continue;
-        // Look for a test companion
-        const testName = e.name.replace(/\.(js|mjs|ts)$/, '.test.$1');
-        const hasTest  = existsSync(join(dir, testName)) ||
-                         existsSync(join(dir, '../test', testName)) ||
-                         existsSync(join(dir, '../tests', testName));
-        if (!hasTest) untested.push(e.name);
-      }
+    for (const f of sourceFiles) {
+      if (testPattern.test(f)) continue;
+      // Look for a test companion
+      const testName = f.replace(/\.(js|mjs|ts)$/, '.test.$1');
+      const hasTest  = existsSync(join(targetDir, testName)) ||
+                       existsSync(join(targetDir, 'test', basename(testName))) ||
+                       existsSync(join(targetDir, 'tests', basename(testName)));
+      if (!hasTest) untested.push(f);
     }
 
-    await walk(targetDir);
     return untested.slice(0, 10);
   }
 
