@@ -1,7 +1,7 @@
 # mind-server — TODO
 
-- [ ] **Multi-agent parallelism** — Vera can dispatch multiple agents in the same cycle when tasks are independent
-- [ ] **MCP server mode** — expose mind-server as an MCP server so Claude Code can talk to it directly
+- [x] **Multi-agent parallelism** — Vera dispatches arrays; scheduler runs them with Promise.all; dispatch/scan locks are now independent
+- [x] **MCP server mode** — `bin/mind-server-mcp.js` (JSON-RPC 2.0 stdio transport, 8 tools)
 
 ## Backlog / Ideas
 

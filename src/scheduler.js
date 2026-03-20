@@ -5,12 +5,13 @@
  *
  *   Dispatch loop  (event-driven + fallback poll, default 30s)
  *     → Wakes immediately when the board changes (post:created / post:updated / dm:sent).
- *     → Runs Vera, then immediately runs whoever she dispatches.
+ *     → Runs Vera, then immediately runs whoever she dispatches (one agent or several in parallel).
  *     → Repeats until Vera says idle. A 30s polling heartbeat catches anything missed.
  *
  *   Scan loop  (slow, default 5 min)
  *     → Runs the audit crew in parallel: Sandra, Bobby, Mallory, Angela, Danielle, Lauren.
  *     → Agents that find nothing return in milliseconds.
+ *     → Runs concurrently with the dispatch loop — scan agents are read-only.
  *
  *   Daily loop  (every 20h)
  *     → Runs Kimberly, who posts a standup to r/general.
@@ -19,7 +20,7 @@
  *   Each agent tracks consecutive failures. After FAILURE_THRESHOLD failures the
  *   agent is paused for COOLDOWN_MS. Paused agents are skipped in #run().
  *   A per-agent timeout of AGENT_TIMEOUT_MS prevents a hung agent from
- *   deadlocking the scheduler's #running flag.
+ *   deadlocking the scheduler's lock flags.
  */
 
 const SCAN_AGENTS       = ['sandra', 'bobby', 'mallory', 'angela', 'danielle', 'lauren'];
@@ -34,7 +35,9 @@ export class Scheduler {
   #agents      = null;
   #board       = null;
   #hub         = null;
-  #running     = false;
+  // Two independent locks — dispatch and scan can now overlap since scan agents are read-only.
+  #dispatchRunning = false;
+  #scanRunning     = false;
   #timers      = [];
   #stopped     = false;
   #unsubWrite  = null;
@@ -64,8 +67,9 @@ export class Scheduler {
     console.log(`[scheduler] starting — dispatch event-driven (poll fallback ${cycleMs / 1000}s), scan every ${scanMs / 1000}s`);
 
     // ── Event-driven dispatch: wake immediately on board writes ───────────────
+    // Only gate on #dispatchRunning — a running scan should not prevent dispatch.
     this.#unsubWrite = this.#board.onWrite(() => {
-      if (!this.#running && !this.#stopped) {
+      if (!this.#dispatchRunning && !this.#stopped) {
         setTimeout(() => this.#dispatchCycle(), 100);
       }
     });
@@ -99,15 +103,16 @@ export class Scheduler {
   }
 
   /**
-   * Wait for any in-flight agent run to complete.
-   * Resolves when idle or when timeoutMs elapses.
+   * Wait for any in-flight agent runs to complete.
+   * Resolves when both dispatch and scan are idle, or when timeoutMs elapses.
    */
   waitForIdle(timeoutMs = 10_000) {
-    if (!this.#running) return Promise.resolve();
+    if (!this.#dispatchRunning && !this.#scanRunning) return Promise.resolve();
     return new Promise(resolve => {
       const start = Date.now();
       const poll  = setInterval(() => {
-        if (!this.#running || Date.now() - start > timeoutMs) {
+        const idle = !this.#dispatchRunning && !this.#scanRunning;
+        if (idle || Date.now() - start > timeoutMs) {
           clearInterval(poll);
           resolve();
         }
@@ -127,7 +132,11 @@ export class Scheduler {
       if (count > 0) failures[name] = count;
     }
     return {
-      running:             this.#running,
+      // `running` stays true when either loop is active (backward-compat with
+      // server.js health/metrics endpoints that check `schedStat.running`).
+      running:             this.#dispatchRunning || this.#scanRunning,
+      dispatchRunning:     this.#dispatchRunning,
+      scanRunning:         this.#scanRunning,
       stopped:             this.#stopped,
       lastCycleMs:         this.#lastCycleMs,
       lastCycleAt:         this.#lastCycleAt,
@@ -140,8 +149,8 @@ export class Scheduler {
   // ── Dispatch loop ────────────────────────────────────────────────────────────
 
   async #dispatchCycle() {
-    if (this.#running || this.#stopped) return;
-    this.#running = true;
+    if (this.#dispatchRunning || this.#stopped) return;
+    this.#dispatchRunning = true;
     const start = Date.now();
     try {
       let hops = 0;
@@ -149,22 +158,35 @@ export class Scheduler {
       while (hops++ < maxHops) {
         const vera = await this.#run('vera');
         if (!vera || vera.outcome === 'idle' || vera.outcome === 'nothing-to-do') break;
+
+        // vera.dispatch may be a single agent name or an array of names.
+        // Run multiple dispatched agents in parallel when Vera returns an array.
         const dispatched = vera.dispatch;
         if (!dispatched) break;
-        await this.#run(dispatched);
+
+        const names = Array.isArray(dispatched) ? dispatched : [dispatched];
+        if (names.length === 0) break;
+
+        if (names.length === 1) {
+          await this.#run(names[0]);
+        } else {
+          console.log(`[scheduler] parallel dispatch: ${names.join(', ')}`);
+          await Promise.all(names.map(name => this.#run(name)));
+        }
       }
     } finally {
-      this.#running    = false;
-      this.#lastCycleMs = Date.now() - start;
-      this.#lastCycleAt = new Date().toISOString();
+      this.#dispatchRunning = false;
+      this.#lastCycleMs    = Date.now() - start;
+      this.#lastCycleAt    = new Date().toISOString();
     }
   }
 
   // ── Scan loop (parallel read-only agents) ────────────────────────────────────
 
   async #scanCycle() {
-    if (this.#running || this.#stopped) return;
-    this.#running = true;
+    // Scan has its own independent lock — it does not block or wait on dispatch.
+    if (this.#scanRunning || this.#stopped) return;
+    this.#scanRunning = true;
     try {
       await Promise.all(
         SCAN_AGENTS
@@ -172,7 +194,7 @@ export class Scheduler {
           .map(name => this.#run(name))
       );
     } finally {
-      this.#running = false;
+      this.#scanRunning = false;
     }
   }
 
@@ -198,7 +220,7 @@ export class Scheduler {
     }
 
     try {
-      // Hard per-agent timeout — prevents #running deadlock if agent hangs
+      // Hard per-agent timeout — prevents lock deadlock if agent hangs
       const result = await withTimeout(
         this.#agents.run(name, { board: this.#board, hub: this.#hub }),
         AGENT_TIMEOUT_MS,

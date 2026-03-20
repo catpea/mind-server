@@ -6,14 +6,21 @@
  *
  * What she does each cycle:
  *   1. Reads board summary (open/planned/in-progress/review counts)
- *   2. Reads recent agent activity from SSE log / board comments
- *   3. Decides which agent should act next
- *   4. Creates a dispatch post in r/dispatch (or DMs the agent)
+ *   2. Reads recent agent activity from memory + scratchpad
+ *   3. Decides which agent(s) should act next — may dispatch multiple in parallel
+ *      when queues are independent (e.g. Amy reviewing requests + Erica implementing)
+ *   4. Creates a dispatch post in r/dispatch and DMs each dispatched agent
  *   5. When AI available: uses Claude to reason about board state
  *      When AI not available: applies simple heuristic rules
  *
+ * Multi-dispatch:
+ *   When multiple independent queues need attention Vera may return an array of
+ *   agent names. The scheduler runs them with Promise.all. Vera only dispatches
+ *   agents that are genuinely independent — she never dispatches two agents that
+ *   write to the same post.
+ *
  * Heuristic (no AI):
- *   - open requests with no todo → Monica
+ *   - open requests with no todo → Amy
  *   - todos in planned/open state → Erica
  *   - todos in review state → Rita
  *   - no quality scan recently → Sandra
@@ -62,8 +69,13 @@ export class Vera extends BaseAgent {
     for (const dm of unanswered) pendingFor[dm.to] = (pendingFor[dm.to] ?? 0) + 1;
     const conversationAgents = Object.keys(pendingFor); // agents that have questions waiting
 
-    // When was Sandra last active?
-    const lastScan = recent.find(m => m.content?.dispatch === 'sandra');
+    // When was Sandra last scanned?
+    // Memory may store `dispatched: ['sandra', ...]` (new) or `dispatch: 'sandra'` (old) — handle both.
+    const lastScan = recent.find(m => {
+      const dispatched = m.content?.dispatched
+        ?? (m.content?.dispatch ? [m.content.dispatch] : []);
+      return dispatched.includes('sandra');
+    });
     const hoursSinceScan = lastScan
       ? (Date.now() - new Date(lastScan.timestamp)) / 3_600_000
       : Infinity;
@@ -79,7 +91,10 @@ export class Vera extends BaseAgent {
     }
 
     if (!dispatch && ctx.ai.isAvailable()) {
-      const recentStr = recent.map(m => `${m.timestamp}: ${m.type} ${JSON.stringify(m.content)}`).join('\n');
+      const recentStr = recent.map(m => {
+        const d = m.content?.dispatched ?? (m.content?.dispatch ? [m.content.dispatch] : []);
+        return `${m.timestamp}: ${m.type} dispatched=[${d.join(',')}]`;
+      }).join('\n');
       const pendingStr = conversationAgents.length
         ? `\n- Active DM conversations waiting for reply: ${conversationAgents.map(a => `${a}(${pendingFor[a]})`).join(', ')}`
         : '';
@@ -97,22 +112,26 @@ Board state:
 - Hours since last quality scan: ${hoursSinceScan.toFixed(1)}
 - Approval gate active: ${gated}${pendingStr}
 
-Your recent actions:
+Your recent dispatches:
 ${recentStr || '(none)'}${scratchSection}
 
 Agents available: amy (PM/triage), monica (planner), erica (implementer), rita (reviewer), sandra (QA scanner)
 
-Respond with JSON: { "dispatch": "<agentName or null>", "reason": "<one sentence>" }
+You may dispatch a SINGLE agent or MULTIPLE independent agents that can safely run in parallel.
+- Safe to parallelise: amy + monica, amy + erica, monica + rita
+- Do NOT parallelise: erica + rita (rita reviews erica's work), two agents on same post
+
+Respond with JSON: { "dispatch": "<name>" | ["<name1>","<name2>"], "reason": "<one sentence>" }
 Dispatch null if all is idle or you dispatched this agent recently.`;
 
-      const result = await ctx.ai.fast.askJSON(prompt, { system: 'You are Vera, an orchestrator. Pick the right agent to run next. Reply with only JSON.' });
+      const result = await ctx.ai.fast.askJSON(prompt, { system: 'You are Vera, an orchestrator. Pick the right agent(s) to run next. Reply with only JSON.' });
       if (result) {
         dispatch = result.dispatch;
         reason   = result.reason;
       }
     }
 
-    // Heuristic fallback
+    // Heuristic fallback (single dispatch — conservative when AI is unavailable)
     if (!dispatch) {
       if (unreviewed.length > 0)      { dispatch = 'amy';    reason = `${unreviewed.length} unreviewed request(s)`; }
       else if (readyToplan.length > 0){ dispatch = 'monica'; reason = `${readyToplan.length} approved request(s) ready to plan`; }
@@ -133,29 +152,44 @@ Dispatch null if all is idle or you dispatched this agent recently.`;
       return { outcome: 'idle', actions };
     }
 
-    this.log(`dispatching ${plan.dispatch} — ${plan.reason}`, ctx);
+    // Normalise to array — Vera may dispatch one or several agents in parallel.
+    const dispatches = Array.isArray(plan.dispatch)
+      ? plan.dispatch.filter(Boolean)
+      : [plan.dispatch].filter(Boolean);
 
-    // Post a dispatch notice so humans can see what's happening
+    if (dispatches.length === 0) {
+      this.log('board is clear — nothing to dispatch', ctx);
+      return { outcome: 'idle', actions };
+    }
+
+    const label = dispatches.join(', ');
+    this.log(`dispatching ${label} — ${plan.reason}`, ctx);
+
+    // Post one dispatch notice listing all dispatched agents
     await board.ensureSub(SUBS.DISPATCH);
     const post = await board.createPost(SUBS.DISPATCH, {
-      title:  `Dispatch: ${plan.dispatch}`,
+      title:  `Dispatch: ${label}`,
       body:   plan.reason,
       author: this.name,
       type:   'announcement',
     });
 
-    // DM the agent
-    await board.sendDM({
-      from:    this.name,
-      to:      plan.dispatch,
-      subject: 'Run request',
-      body:    plan.reason,
-      meta:    { [META.DISPATCH_POST_ID]: post.id },
-    });
+    // Send individual DMs to each dispatched agent
+    for (const name of dispatches) {
+      await board.sendDM({
+        from:    this.name,
+        to:      name,
+        subject: 'Run request',
+        body:    plan.reason,
+        meta:    { [META.DISPATCH_POST_ID]: post.id },
+      });
+      actions.push({ type: 'dispatch', agent: name, reason: plan.reason });
+    }
 
-    await this.remember('dispatch', { dispatch: plan.dispatch, reason: plan.reason });
-    actions.push({ type: 'dispatch', agent: plan.dispatch, reason: plan.reason });
+    // Store as `dispatched: string[]` — new format. Old code that looks for
+    // `dispatch: 'name'` is handled in think() with a backward-compat lookup.
+    await this.remember('dispatch', { dispatched: dispatches, reason: plan.reason });
 
-    return { outcome: 'dispatched', dispatch: plan.dispatch, actions };
+    return { outcome: 'dispatched', dispatch: dispatches, actions };
   }
 }
