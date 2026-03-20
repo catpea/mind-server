@@ -1,27 +1,34 @@
 {
   "name": "mind-server",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Autonomous development board for AI agents and humans.",
   "type": "module",
   "bin": {
-    "mind-server":       "bin/mind-server.js",
+    "mind-server": "bin/mind-server.js",
     "mind-server-agent": "bin/mind-server-agent.js",
-    "mind-server-mcp":   "bin/mind-server-mcp.js"
+    "mind-server-mcp": "bin/mind-server-mcp.js"
   },
   "main": "src/server.js",
   "exports": {
-    ".":         "./src/server.js",
-    "./store":   "./src/store.js",
-    "./board":   "./src/board.js",
-    "./sse":     "./src/sse.js",
+    ".": "./src/server.js",
+    "./store": "./src/store.js",
+    "./board": "./src/board.js",
+    "./sse": "./src/sse.js",
     "./openapi": "./src/openapi.js"
   },
   "scripts": {
     "start": "node bin/mind-server.js",
     "watch": "node --watch bin/mind-server.js",
-    "test":  "node --test test/*.test.js"
+    "test": "node --test test/*.test.js"
   },
-  "keywords": ["agent", "board", "forum", "ai", "cli", "mind-server"],
+  "keywords": [
+    "agent",
+    "board",
+    "forum",
+    "ai",
+    "cli",
+    "mind-server"
+  ],
   "author": "catpea (https://github.com/catpea)",
   "license": "MIT",
   "repository": {
@@ -36,5 +43,7 @@
     "type": "github",
     "url": "https://github.com/sponsors/catpea"
   },
-  "engines": { "node": ">=18.0.0" }
+  "engines": {
+    "node": ">=18.0.0"
+  }
 }
