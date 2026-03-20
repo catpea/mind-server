@@ -1,6 +1,6 @@
 {
   "name": "mind-server",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Autonomous development board for AI agents and humans.",
   "type": "module",
   "bin": {
